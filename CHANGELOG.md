@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Green/off-grid mode moved to its real register bit — register 110 bit
+  layout unified lineage-wide**
+  ([eg4_web_monitor#476](https://github.com/joyfulhouse/eg4_web_monitor/issues/476),
+  also the unexplained tail of
+  [eg4_web_monitor#194](https://github.com/joyfulhouse/eg4_web_monitor/issues/194)):
+  a live 18kPV toggle test (2026-07-21) proved `FUNC_GREEN_EN` lives at
+  register 110 **bit 14** (raw 1056 ↔ 17440, single-bit delta, EG4 cloud
+  decode in lockstep), not the bit 8 the local table claimed — so every
+  LOCAL/HYBRID green-mode write flipped a PVCT-sampling config bit while
+  reporting success, and local reads never reflected the real state. Both
+  hardware-toggle-tested families (18kPV #476, 12000XP PR #220) match the
+  lxp_modbus `H_FUNCTION_ENABLE_3` lineage layout, so the base and
+  `EG4_OFFGRID` register-110 tables are now one shared
+  `REGISTER_110_PARAM_KEYS` (green 14, Battery ECO 15, buzzer 7; disproven
+  or unverified slots demoted to `FUNC_110_BITn` placeholders — the removed
+  local decode keys `FUNC_GO_TO_OFFGRID`, `BIT_WORKING_MODE`,
+  `BIT_PVCT_SAMPLE_TYPE`, `BIT_PVCT_SAMPLE_RATIO` and `BIT_CT_SAMPLE_RATIO`
+  were never hardware-verified positions). The EG4_OFFGRID "green is
+  cloud-only" restriction is lifted: with the bit pinned, local reads and
+  writes work on every family. `OFFGRID_REGISTER_110_PARAM_KEYS` remains as
+  a back-compat alias of the unified list.
+- **`FUNC_<register>_BIT<n>` placeholders are now decode-only**:
+  `write_named_parameters` raises `ValueError` for them instead of
+  read-modify-writing the bit. The placeholders exist so reads decode a
+  register honestly rather than mislabelling unverified bits; letting a
+  caller write one would flip an unidentified device setting — the exact
+  failure mode of #476, under a new name. Reads are unaffected.
+- `_offgrid_register_to_param_keys()` now copies the per-register key lists
+  as well as the outer dict, so a caller mutating the returned mapping can
+  no longer corrupt the shared module-level table (its docstring already
+  promised this).
+
 - **Post-outage lifetime-energy catch-up deltas no longer rejected as spikes**
   ([eg4_web_monitor#479](https://github.com/joyfulhouse/eg4_web_monitor/issues/479)):
   while a device is offline the portal serves its lifetime counters frozen, so
@@ -21,6 +53,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   previously dropped by pydantic) or a transport link-down transition. Idle
   devices keep the tight always-on corruption canary, and 0xFFFF-scale jumps
   exceed even the widened cap.
+
+### Removed
+
+- **Five register-110 local decode keys**: `FUNC_GO_TO_OFFGRID`,
+  `BIT_WORKING_MODE`, `BIT_PVCT_SAMPLE_TYPE`, `BIT_PVCT_SAMPLE_RATIO` and
+  `BIT_CT_SAMPLE_RATIO` no longer appear in local (Modbus) reads of
+  register 110. The 2026-07-21 18kPV toggle test disproved their bit
+  positions — a local read reporting them was reporting fiction — and the
+  affected bits are now `FUNC_110_BITn` placeholders. This drops published
+  canonical names from `HOLDING_BY_NAME` / `HOLDING_BY_API_KEY` /
+  `PARAM_KEY_TO_REGISTER`, so it is a breaking change for any caller that
+  reads these keys from a **local** transport: they now get nothing rather
+  than a wrong value. No consumer in this library or the EG4 integration
+  bound to them, and the cloud API is unchanged — it still returns its own
+  keys, which remain listed in `GRIDBOSS_PARAMETERS`.
 
 ### Added
 
