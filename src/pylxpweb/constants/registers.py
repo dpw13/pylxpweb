@@ -582,9 +582,12 @@ WEB_PARAM_TO_HOLD_REGISTER = {
 # Register 110 system-function bit layout — SHARED by every inverter family
 # (eg4_web_monitor #476). Both families ever hardware-toggle-tested (18kPV
 # 2026-07-21, 12000XP/SNA PR #220) match the ant0nkr/lxp_modbus
-# H_FUNCTION_ENABLE_3 lineage layout in every tested position, while the
-# historic 18kPV-specific upper-bit table matched none of them — so the
-# hybrid and EG4_OFFGRID tables no longer diverge. Displaced/unproven slots
+# H_FUNCTION_ENABLE_3 lineage layout in every *toggle-tested* position
+# (bits 7, 14, 15), while the historic 18kPV-specific upper-bit table
+# matched none of them — so the hybrid and EG4_OFFGRID tables no longer
+# diverge. That agreement does NOT extend to every bit: at bit 5 the EG4
+# cloud decode and lxp_modbus genuinely disagree (see below), and no
+# toggle test has separated them. Displaced/unproven slots
 # are FUNC_110_BITn placeholders (same convention as reg 179/233 unknowns):
 # an honest gap beats an unverified decode served as truth — a local write
 # through a wrong slot flips an unrelated config bit while reporting
@@ -596,8 +599,12 @@ WEB_PARAM_TO_HOLD_REGISTER = {
 #          lxp_modbus).
 #   5:     FUNC_TAKE_LOAD_TOGETHER — live 18kPV read 2026-07-21: raw bit 5
 #          set while the EG4 cloud decode reports TAKE_LOAD_TOGETHER as the
-#          only set FUNC_ (lxp_modbus puts a CT-ratio bit here; the EG4
-#          firmware's own decode wins).
+#          only set FUNC_ (lxp_modbus puts a CT-ratio bit here and
+#          TakeLoadTogether at bit 10; the EG4 firmware's own decode wins).
+#          UNRESOLVED: that read had bits 5 and 10 both set (raw 0x0420),
+#          so it cannot separate the two candidate layouts — only a toggle
+#          test can. Carried over unchanged from before #476; nothing in
+#          this library or the EG4 integration writes this key.
 #   6:     unknown (old table's buzzer slot; buzzer is pinned at 7).
 #   7:     FUNC_BUZZER_EN — SNA cloud decode + constant raw 0x0080
 #          (PR #220); lxp_modbus agrees lineage-wide.
@@ -968,9 +975,9 @@ def _offgrid_register_to_param_keys() -> dict[int, list[str]]:
     18kPV toggle test (eg4_web_monitor #476) unified the layouts; the
     base mapping is now correct for every family. Still returns a copy,
     like the pre-unification override did, so callers cannot mutate the
-    shared module-level table.
+    shared module-level table — including its per-register key lists.
     """
-    return dict(REGISTER_TO_PARAM_KEYS)
+    return {register: list(keys) for register, keys in REGISTER_TO_PARAM_KEYS.items()}
 
 
 # ============================================================================

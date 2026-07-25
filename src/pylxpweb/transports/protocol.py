@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import TYPE_CHECKING, Any, Protocol, Self, runtime_checkable
 
 if TYPE_CHECKING:
@@ -16,6 +17,12 @@ if TYPE_CHECKING:
     from .data import BatteryBankData, InverterEnergyData, InverterRuntimeData
 
 _LOGGER = logging.getLogger(__name__)
+
+# FUNC_<register>_BIT<n> keys name bit positions whose function has never been
+# hardware-verified. They exist so reads decode the whole register honestly
+# rather than mislabelling unknown bits — writing one would flip an unknown
+# device setting, which is the failure mode of eg4_web_monitor #476.
+_PLACEHOLDER_PARAM_RE = re.compile(r"FUNC_\d+_BIT\d+")
 
 
 class _ReentrantAsyncLock:
@@ -544,6 +551,13 @@ class BaseTransport:
         for param_name, value in parameters.items():
             if param_name not in param_to_register:
                 raise ValueError(f"Unknown parameter name: {param_name}")
+
+            if _PLACEHOLDER_PARAM_RE.fullmatch(param_name):
+                raise ValueError(
+                    f"Refusing to write placeholder parameter '{param_name}': this bit's "
+                    "function is not hardware-verified, and writing it would alter an "
+                    "unknown device setting. Placeholders are decode-only."
+                )
 
             register_addr = param_to_register[param_name]
             param_keys = register_to_params.get(register_addr, [])

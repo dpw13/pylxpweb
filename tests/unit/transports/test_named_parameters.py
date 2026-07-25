@@ -867,6 +867,14 @@ class TestRegister110UnifiedLayout:
         offgrid[9999] = ["FAKE_PARAM"]
         assert 9999 not in REGISTER_TO_PARAM_KEYS
 
+        # The per-register lists must be copies too: a shallow dict() copy
+        # shares them, so mutating one here would corrupt register 110's
+        # layout process-wide for every family.
+        original = list(REGISTER_TO_PARAM_KEYS[110])
+        offgrid[110].append("FAKE_BIT")
+        offgrid[110][0] = "CLOBBERED"
+        assert REGISTER_TO_PARAM_KEYS[110] == original
+
     def test_param_to_register_resolves_green_eco_buzzer(self) -> None:
         """Reverse mapping resolves the pinned bits to register 110."""
         from pylxpweb.constants.registers import get_param_to_register_mapping
@@ -957,15 +965,18 @@ class TestRegister110UnifiedLayout:
         hybrid_transport.write_parameters.assert_called_once_with({110: 1056})
 
     @pytest.mark.asyncio
-    async def test_offgrid_green_write_now_supported(
+    async def test_offgrid_green_write_targets_bit_14(
         self, offgrid_transport: ModbusTransport
     ) -> None:
-        """SNA green writes no longer fail closed — bit 14 is pinned.
+        """Offgrid green writes hit bit 14, not the disproven bit 8.
 
-        The previous cloud-only restriction existed because green's
-        position was unverified on this family; with the 18kPV toggle test
-        pinning bit 14 (matching lxp_modbus lineage-wide), local writes are
-        enabled on every family.
+        Two different prior behaviours converge here. On the base layout
+        (18kPV and friends) green was mapped to bit 8, so the write went
+        out and silently flipped the PVCT-sampling region. On the offgrid
+        layout `FUNC_GREEN_EN` was absent entirely, so the write was
+        rejected — fail-closed, cloud-routed by the HA integration. With
+        bit 14 pinned by the 18kPV toggle test the layouts are unified and
+        both paths write bit 14. Bit 8 must never be touched.
         """
         offgrid_transport.read_parameters = AsyncMock(return_value={110: 0x0080})
 
@@ -973,6 +984,24 @@ class TestRegister110UnifiedLayout:
 
         assert result is True
         offgrid_transport.write_parameters.assert_called_once_with({110: 0x4080})
+        written = offgrid_transport.write_parameters.call_args[0][0][110]
+        assert not written & (1 << 8), "bit 8 (old green slot) must stay untouched"
+
+    @pytest.mark.asyncio
+    async def test_placeholder_bits_are_not_writable(
+        self, offgrid_transport: ModbusTransport
+    ) -> None:
+        """Unverified bit placeholders decode but refuse to be written.
+
+        Writing one would flip a device setting nobody has identified —
+        exactly the #476 failure mode, under a new name.
+        """
+        offgrid_transport.read_parameters = AsyncMock(return_value={110: 0x0080})
+
+        with pytest.raises(ValueError, match="placeholder"):
+            await offgrid_transport.write_named_parameters({"FUNC_110_BIT8": True})
+
+        offgrid_transport.write_parameters.assert_not_called()
 
     # ------------------------------------------------------------------
     # Read path (decode)
