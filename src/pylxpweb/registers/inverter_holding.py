@@ -968,7 +968,15 @@ INVERTER_HOLDING_REGISTERS: tuple[HoldingRegisterDefinition, ...] = (
         address=110,
         bit_position=5,
         canonical_name="take_load_together",
-        api_param_key="FUNC_TAKE_LOAD_TOGETHER",  # verified
+        # DISPUTED POSITION, not verified: EG4's cloud decode puts this at
+        # bit 5, ant0nkr/lxp_modbus puts a CT-ratio field at 5-6 and
+        # TakeLoadTogether at bit 10, and the one live read that could
+        # separate them had both bits set (raw 0x0420). The name is EG4's,
+        # so reads keep it; LOCAL writes are refused via
+        # DISPUTED_WRITE_BLOCKED_PARAMS until a toggle capture settles it.
+        # The old "# verified" here meant the NAME matched the cloud, never
+        # that the bit was toggle-tested — the exact conflation behind #476.
+        api_param_key="FUNC_TAKE_LOAD_TOGETHER",
         category=HoldingCategory.FUNCTION,
         description="Take load together mode (parallel load sharing).",
     ),

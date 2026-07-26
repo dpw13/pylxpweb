@@ -972,6 +972,41 @@ REGISTER_TO_PARAM_KEYS: dict[int, list[str]] = {
 OFFGRID_REGISTER_110_PARAM_KEYS: list[str] = REGISTER_110_PARAM_KEYS
 
 
+# Named parameters whose bit position is genuinely DISPUTED between two
+# credible sources, as opposed to simply unknown. Unknown bits are
+# FUNC_<reg>_BIT<n> placeholders and are refused by name pattern; these keep
+# a real name because a first-party source does identify them, so they decode
+# normally — but they must not be WRITTEN over a LOCAL transport, for exactly
+# the reason the placeholders must not be: if the position is wrong the
+# firmware still ACKs and some other setting silently moves (#476).
+#
+# Deliberately LOCAL-ONLY. The cloud functionControl endpoint writes by NAME
+# and EG4's own server resolves it to whichever bit EG4 uses, so the cloud
+# path carries none of this risk — it is the local path, where WE compute the
+# bit position, that can land on the wrong one. Do not "fix" the asymmetry by
+# extending this to ControlEndpoints.control_function(): that would remove a
+# working capability to guard against a hazard the cloud path does not have.
+#
+#   FUNC_TAKE_LOAD_TOGETHER — EG4's own cloud decode puts it at register 110
+#   bit 5; ant0nkr/lxp_modbus puts a CT-sample-ratio field at bits 5-6 and
+#   TakeLoadTogether at bit 10. The live 18kPV read that would settle it had
+#   bits 5 AND 10 both set (raw 0x0420), so it separates nothing. Reads keep
+#   EG4's name because EG4's decode is first-party evidence; writes wait for
+#   a toggle capture. See pylxpweb #242.
+DISPUTED_WRITE_BLOCKED_PARAMS: frozenset[str] = frozenset({"FUNC_TAKE_LOAD_TOGETHER"})
+
+
+def _copy_register_mapping(mapping: dict[int, list[str]]) -> dict[int, list[str]]:
+    """Copy a register→param-key mapping, including its per-register lists.
+
+    A plain ``dict()`` copy shares the inner lists, which is worse than no
+    copy at all: it looks defensive while leaving the part that actually
+    matters — bit ordering, since a bit position IS a list index — open to
+    mutation by any caller.
+    """
+    return {register: list(keys) for register, keys in mapping.items()}
+
+
 def _offgrid_register_to_param_keys() -> dict[int, list[str]]:
     """Return the EG4_OFFGRID register→param mapping.
 
@@ -981,7 +1016,7 @@ def _offgrid_register_to_param_keys() -> dict[int, list[str]]:
     like the pre-unification override did, so callers cannot mutate the
     shared module-level table — including its per-register key lists.
     """
-    return {register: list(keys) for register, keys in REGISTER_TO_PARAM_KEYS.items()}
+    return _copy_register_mapping(REGISTER_TO_PARAM_KEYS)
 
 
 # ============================================================================
@@ -1856,13 +1891,20 @@ def get_register_to_param_mapping(
     """
     # The HTTP transport handles family-specific differences on the server
     # side; this mapping only drives LOCAL (Modbus/dongle) named access.
+    #
+    # Every branch returns a copy, including the per-register key lists.
+    # Bit positions are list indices, so a caller that mutates a returned
+    # list would silently reorder bits for every subsequent read and write
+    # in the process — the #476 failure mode reached through a different
+    # door. Measured at ~4.5 us per call against a table of 86 registers,
+    # which is noise beside the Modbus round-trip it precedes.
     if device_type == "MIDBOX":
-        return MIDBOX_REGISTER_TO_PARAM_KEYS
+        return _copy_register_mapping(MIDBOX_REGISTER_TO_PARAM_KEYS)
 
     if family == "EG4_OFFGRID":
         return _offgrid_register_to_param_keys()
 
-    return REGISTER_TO_PARAM_KEYS
+    return _copy_register_mapping(REGISTER_TO_PARAM_KEYS)
 
 
 def get_param_to_register_mapping(

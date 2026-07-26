@@ -30,6 +30,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cloud-only" restriction is lifted: with the bit pinned, local reads and
   writes work on every family. `OFFGRID_REGISTER_110_PARAM_KEYS` remains as
   a back-compat alias of the unified list.
+- **Every register-mapping branch now returns an isolated copy**
+  ([#245](https://github.com/joyfulhouse/pylxpweb/issues/245)):
+  `get_register_to_param_mapping()` handed back the live module-level dict
+  *and its per-register lists* on every branch except `EG4_OFFGRID`
+  (default, and `device_type="MIDBOX"`). Bit positions are list indices, so
+  a caller mutating a returned list reordered bits process-wide for every
+  subsequent named read and write. Measured at ~4.5 us per copy over 86
+  registers — noise beside the Modbus round-trip it precedes — so the
+  published `dict[int, list[str]]` return type is unchanged.
+- **Writes to disputed bit positions are refused**
+  ([#242](https://github.com/joyfulhouse/pylxpweb/issues/242)):
+  `write_named_parameters` raises `ValueError` for
+  `FUNC_TAKE_LOAD_TOGETHER`, whose register-110 bit is claimed at 5 by
+  EG4's own decode and at 10 by ant0nkr/lxp_modbus, with the one live read
+  that could separate them showing both bits set. Reads are unaffected and
+  keep EG4's name. **This is local-transport only** — the cloud
+  functionControl endpoint writes by name and EG4 resolves the bit itself,
+  so that path is unaffected and still works. Nothing in this library or
+  the EG4 integration writes the key, so no caller changes behaviour.
 - **`FUNC_<register>_BIT<n>` placeholders are now decode-only**:
   `write_named_parameters` raises `ValueError` for them instead of
   read-modify-writing the bit. The placeholders exist so reads decode a
