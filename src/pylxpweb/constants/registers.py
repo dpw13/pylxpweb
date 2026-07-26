@@ -976,9 +976,16 @@ OFFGRID_REGISTER_110_PARAM_KEYS: list[str] = REGISTER_110_PARAM_KEYS
 # credible sources, as opposed to simply unknown. Unknown bits are
 # FUNC_<reg>_BIT<n> placeholders and are refused by name pattern; these keep
 # a real name because a first-party source does identify them, so they decode
-# normally — but they must not be WRITTEN, for exactly the reason the
-# placeholders must not be: if the position is wrong the firmware still ACKs
-# and some other setting silently moves (eg4_web_monitor #476).
+# normally — but they must not be WRITTEN over a LOCAL transport, for exactly
+# the reason the placeholders must not be: if the position is wrong the
+# firmware still ACKs and some other setting silently moves (#476).
+#
+# Deliberately LOCAL-ONLY. The cloud functionControl endpoint writes by NAME
+# and EG4's own server resolves it to whichever bit EG4 uses, so the cloud
+# path carries none of this risk — it is the local path, where WE compute the
+# bit position, that can land on the wrong one. Do not "fix" the asymmetry by
+# extending this to ControlEndpoints.control_function(): that would remove a
+# working capability to guard against a hazard the cloud path does not have.
 #
 #   FUNC_TAKE_LOAD_TOGETHER — EG4's own cloud decode puts it at register 110
 #   bit 5; ant0nkr/lxp_modbus puts a CT-sample-ratio field at bits 5-6 and

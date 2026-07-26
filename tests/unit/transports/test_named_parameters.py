@@ -897,6 +897,13 @@ class TestRegister110UnifiedLayout:
         one caller mutating a returned list reorders bits process-wide for
         every subsequent read and write — #476's failure mode via another
         door.
+
+        There are only three real branches (MIDBOX, EG4_OFFGRID, default),
+        so the four default-family cases are deliberately redundant: they
+        pin that no family string quietly acquires an override that skips
+        the copy. Against the pre-fix code all six fail, but not all six
+        for their own sake — the leaked table lets one case's mutation
+        corrupt the next, which is the process-wide damage this guards.
         """
         from pylxpweb.constants.registers import (
             MIDBOX_REGISTER_TO_PARAM_KEYS,
