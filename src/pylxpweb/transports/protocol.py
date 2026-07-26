@@ -539,7 +539,11 @@ class BaseTransport:
                 "BIT_MIDBOX_SP_MODE_1": 2,  # AC Couple
             })
         """
-        from pylxpweb.constants.registers import LOCAL_PARAM_SCALE_DIV10, MULTI_BIT_FIELDS
+        from pylxpweb.constants.registers import (
+            DISPUTED_WRITE_BLOCKED_PARAMS,
+            LOCAL_PARAM_SCALE_DIV10,
+            MULTI_BIT_FIELDS,
+        )
 
         register_to_params, param_to_register = self._resolve_register_mappings(
             param_names=list(parameters.keys()),
@@ -557,6 +561,14 @@ class BaseTransport:
                     f"Refusing to write placeholder parameter '{param_name}': this bit's "
                     "function is not hardware-verified, and writing it would alter an "
                     "unknown device setting. Placeholders are decode-only."
+                )
+
+            if param_name in DISPUTED_WRITE_BLOCKED_PARAMS:
+                raise ValueError(
+                    f"Refusing to write '{param_name}': two credible sources disagree "
+                    "about which bit it occupies, and no toggle test has separated "
+                    "them. A write to the wrong bit is ACKed by the firmware and "
+                    "silently changes a different setting. Reads are unaffected."
                 )
 
             register_addr = param_to_register[param_name]

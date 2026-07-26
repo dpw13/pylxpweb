@@ -875,6 +875,51 @@ class TestRegister110UnifiedLayout:
         offgrid[110][0] = "CLOBBERED"
         assert REGISTER_TO_PARAM_KEYS[110] == original
 
+    @pytest.mark.parametrize(
+        ("family", "device_type"),
+        [
+            ("EG4_OFFGRID", None),
+            ("EG4_HYBRID", None),
+            ("LXP", None),
+            ("UNKNOWN", None),
+            (None, None),
+            (None, "MIDBOX"),
+        ],
+        ids=["offgrid", "hybrid", "lxp", "unknown", "no-family", "midbox"],
+    )
+    def test_every_mapping_branch_returns_an_isolated_copy(
+        self, family: str | None, device_type: str | None
+    ) -> None:
+        """No branch hands back the live module table (pylxpweb #245).
+
+        Only EG4_OFFGRID used to copy; every other branch returned the
+        shared dict AND its inner lists. Bit positions are list indices, so
+        one caller mutating a returned list reorders bits process-wide for
+        every subsequent read and write — #476's failure mode via another
+        door.
+        """
+        from pylxpweb.constants.registers import (
+            MIDBOX_REGISTER_TO_PARAM_KEYS,
+            REGISTER_TO_PARAM_KEYS,
+            get_register_to_param_mapping,
+        )
+
+        source = (
+            MIDBOX_REGISTER_TO_PARAM_KEYS if device_type == "MIDBOX" else REGISTER_TO_PARAM_KEYS
+        )
+        before = {register: list(keys) for register, keys in source.items()}
+
+        mapping = get_register_to_param_mapping(family, device_type=device_type)
+        assert mapping is not source, "returned the live module dict"
+
+        a_register = next(iter(mapping))
+        mapping[a_register].append("FAKE_BIT")
+        mapping[a_register].insert(0, "CLOBBERED")
+        mapping[123456] = ["FAKE_REGISTER"]
+
+        assert source == before, "caller mutation reached the module table"
+        assert 123456 not in source
+
     def test_param_to_register_resolves_green_eco_buzzer(self) -> None:
         """Reverse mapping resolves the pinned bits to register 110."""
         from pylxpweb.constants.registers import get_param_to_register_mapping
@@ -986,6 +1031,28 @@ class TestRegister110UnifiedLayout:
         offgrid_transport.write_parameters.assert_called_once_with({110: 0x4080})
         written = offgrid_transport.write_parameters.call_args[0][0][110]
         assert not written & (1 << 8), "bit 8 (old green slot) must stay untouched"
+
+    @pytest.mark.asyncio
+    async def test_disputed_bit_decodes_but_is_not_writable(
+        self, offgrid_transport: ModbusTransport
+    ) -> None:
+        """A disputed bit still reads, but refuses to be written (#242).
+
+        FUNC_TAKE_LOAD_TOGETHER keeps EG4's own name because EG4's cloud
+        decode is first-party evidence for bit 5. lxp_modbus puts it at
+        bit 10 instead, and the one live read that could separate them had
+        both bits set. Writing the wrong one is ACKed and moves some other
+        setting, so writes wait for a toggle capture while reads carry on.
+        """
+        offgrid_transport.read_parameters = AsyncMock(return_value={110: 0x0020})
+
+        decoded = await offgrid_transport.read_named_parameters(110, 1)
+        assert decoded["FUNC_TAKE_LOAD_TOGETHER"] is True
+
+        with pytest.raises(ValueError, match="disagree"):
+            await offgrid_transport.write_named_parameters({"FUNC_TAKE_LOAD_TOGETHER": False})
+
+        offgrid_transport.write_parameters.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_placeholder_bits_are_not_writable(
