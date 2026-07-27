@@ -408,29 +408,51 @@ class AnalyticsEndpoints(BaseEndpoint):
             event_filter: Event type filter ("_all", or specific fault/warning code)
 
         Returns:
-            Dict containing:
+            Dict containing (live-validated response shape, 2026-07-16):
                 - success: Boolean
                 - total: Total number of events
                 - rows: List of event objects with:
-                    - eventId: Event identifier
-                    - eventCode: Fault/warning code
-                    - eventType: FAULT/WARNING/INFO
+                    - recordId: Event record identifier
+                    - serialNum: Device serial number
+                    - datalogSn: Dongle serial number
+                    - plantName: Station name
+                    - event: Event code (E###=fault, W###=warning)
+                    - eventType: observed values FAULT/WARNING/INFO, plus
+                      MIDBOX_WARNING from GridBOSS/MID devices.  Not a closed
+                      set — treat unrecognized values as passthrough.
+                    - eventTypeText: Localized category ("Fault", "Notice")
                     - eventText: Human-readable description
-                    - startTime: Event start timestamp
-                    - endTime: Event end timestamp (empty if ongoing)
-                    - statusText: ACTIVE/RESOLVED
+                    - startTime: Event start, portal-local "YYYY-MM-DD
+                      HH:MM:SS" (naive — no timezone or UTC offset)
+                    - startSlashTime: Same instant, "YYYY/MM/DD HH:MM:SS"
+                    - renormalTime: Return-to-normal in the same dash format
+                      (null while ongoing)
+                    - renormalSlashTime: Same instant in slash format.  Its
+                      value on an ongoing event is unattested — observed rows
+                      omit the key entirely rather than sending null.
+                    - faultDuration: Duration in hours (string)
+                    - status: OPEN (active) / CLOSE (resolved)
+
+                Rows may carry keys beyond these; treat the shape as open.
+                ``docs/luxpower-api.yaml`` (EventListResponse) is the typed
+                contract for the same fields.
 
         Example:
             # Get all events
             events = await client.analytics.get_event_list("1234567890")
             for event in events["rows"]:
-                if event["statusText"] == "ACTIVE":
+                if event["status"] == "OPEN":
                     print(f"Active {event['eventType']}: {event['eventText']}")
 
-            # Get only faults
-            faults = await client.analytics.get_event_list(
+            # Filter server-side by a specific event code, not by category:
+            # event_filter is sent as the request's eventText field, so it
+            # takes "_all" or a code like "E019" — NOT an eventType value
+            # such as "FAULT".  No caller in this project uses anything but
+            # the "_all" default, so the code form is unverified; filtering
+            # the returned rows on eventType is the attested approach.
+            bus_faults = await client.analytics.get_event_list(
                 "1234567890",
-                event_filter="FAULT"
+                event_filter="E019",
             )
         """
         await self.client._ensure_authenticated()
