@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.39b5] - 2026-07-27
+
+This section accumulates the whole 0.9.39 beta line: b1 through b4 were tagged
+without their own changelog sections, so their entries are collected here rather
+than re-attributed. New in **b5** specifically: the battery RS485 short-read
+guard and its clamped-slave handling, green-mode helpers on transport-created
+LOCAL instances, the `get_event_list` response-shape correction, per-branch
+register-mapping isolation, and the disputed-bit write refusal.
+
 ### Fixed
 
 - **Battery RS485 transport now rejects truncated register responses**:
