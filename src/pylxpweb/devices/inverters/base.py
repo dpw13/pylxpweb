@@ -2491,6 +2491,50 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
     # Green Mode Control (Off-Grid Mode in Web Monitor)
     # ============================================================================
 
+    async def _set_green_mode(self, enabled: bool) -> bool:
+        """Set green mode through cloud, or LOCAL when no client exists.
+
+        Register 110 bit 14 (FUNC_GREEN_EN, hardware toggle-verified
+        2026-07-21, eg4_web_monitor #476). A client-bearing inverter keeps
+        the historical cloud route, even when a HYBRID local transport is
+        attached. A clientless LOCAL inverter uses the transport's named
+        parameter API, whose operation lock spans the full read-modify-write.
+        """
+        from pylxpweb.constants import FUNC_SYS_BIT_GREEN_EN, FUNC_SYS_REGISTER
+        from pylxpweb.transports.exceptions import TransportError
+
+        client = self._client
+        if client is not None:
+            if enabled:
+                response = await client.api.control.enable_green_mode(self.serial_number)
+            else:
+                response = await client.api.control.disable_green_mode(self.serial_number)
+            success = bool(response.success)
+        else:
+            transport = self._transport
+            if transport is None:
+                raise LuxpowerDeviceError(
+                    f"Register {FUNC_SYS_REGISTER} write requires a transport or a cloud client"
+                )
+
+            param_key = self._cloud_param_key(FUNC_SYS_REGISTER, FUNC_SYS_BIT_GREEN_EN)
+            try:
+                success = await transport.write_named_parameters({param_key: enabled})
+            except TransportError as err:
+                raise LuxpowerDeviceError(
+                    f"Register {FUNC_SYS_REGISTER} write requires a successful Modbus write"
+                ) from err
+            if not success:
+                raise LuxpowerDeviceError(
+                    f"Register {FUNC_SYS_REGISTER} write requires a successful Modbus write"
+                )
+
+        # Invalidate parameter cache on successful write
+        if success:
+            self._parameters_cache_time = None
+
+        return success
+
     async def enable_green_mode(self) -> bool:
         """Enable green mode (off-grid mode in the web monitoring display).
 
@@ -2498,20 +2542,30 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
         EG4 web monitoring interface. When enabled, the inverter operates in
         an off-grid optimized configuration.
 
-        Note: This is FUNC_GREEN_EN in register 110, distinct from FUNC_EPS_EN
-        (battery backup/EPS mode) in register 21.
+        Note: This is FUNC_GREEN_EN in register 110 (bit 14), distinct from
+        FUNC_EPS_EN (battery backup/EPS mode) in register 21.
+
+        Route selection is client-first for compatibility: cloud-created and
+        HYBRID instances use the cloud function-control endpoint. A
+        transport-created LOCAL instance with no cloud client uses the
+        lock-held named-parameter RMW on its transport.
 
         Universal control: All inverters support green mode.
 
         Returns:
-            True if successful
+            True if successful; in cloud mode, False if the API rejected the
+            write
+
+        Raises:
+            LuxpowerDeviceError: On the transport route, if the Modbus write
+                fails; or, on any route, if the instance has neither a
+                transport nor a cloud client attached.
 
         Example:
             >>> await inverter.enable_green_mode()
             True
         """
-        result = await self._client.api.control.enable_green_mode(self.serial_number)
-        return result.success
+        return await self._set_green_mode(enabled=True)
 
     async def disable_green_mode(self) -> bool:
         """Disable green mode (off-grid mode in the web monitoring display).
@@ -2520,38 +2574,59 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
         EG4 web monitoring interface. When disabled, the inverter operates in
         standard grid-tied configuration.
 
-        Note: This is FUNC_GREEN_EN in register 110, distinct from FUNC_EPS_EN
-        (battery backup/EPS mode) in register 21.
+        Note: This is FUNC_GREEN_EN in register 110 (bit 14), distinct from
+        FUNC_EPS_EN (battery backup/EPS mode) in register 21.
+
+        Route selection is client-first for compatibility: cloud-created and
+        HYBRID instances use the cloud function-control endpoint. A
+        transport-created LOCAL instance with no cloud client uses the
+        lock-held named-parameter RMW on its transport.
 
         Universal control: All inverters support green mode.
 
         Returns:
-            True if successful
+            True if successful; in cloud mode, False if the API rejected the
+            write
+
+        Raises:
+            LuxpowerDeviceError: On the transport route, if the Modbus write
+                fails; or, on any route, if the instance has neither a
+                transport nor a cloud client attached.
 
         Example:
             >>> await inverter.disable_green_mode()
             True
         """
-        result = await self._client.api.control.disable_green_mode(self.serial_number)
-        return result.success
+        return await self._set_green_mode(enabled=False)
 
     async def get_green_mode_status(self) -> bool:
         """Get current green mode (off-grid mode) status.
 
         Green Mode controls the off-grid operating mode toggle visible in the
-        EG4 web monitoring interface.
+        EG4 web monitoring interface. Cloud-created and HYBRID instances keep
+        the historical cloud status endpoint. A clientless LOCAL instance
+        reads register 110 bit 14 directly.
 
         Universal control: All inverters support green mode.
 
         Returns:
             True if green mode is enabled, False otherwise
 
+        Raises:
+            LuxpowerDeviceError: On the transport route, if the Modbus read
+                fails; or, on any route, if the instance has neither a
+                transport nor a cloud client attached.
+
         Example:
             >>> is_enabled = await inverter.get_green_mode_status()
             >>> is_enabled
             True
         """
-        return await self._client.api.control.get_green_mode_status(self.serial_number)
+        from pylxpweb.constants import FUNC_SYS_BIT_GREEN_EN, FUNC_SYS_REGISTER
+
+        if self._client is not None:
+            return await self._client.api.control.get_green_mode_status(self.serial_number)
+        return await self._get_register_bit(FUNC_SYS_REGISTER, FUNC_SYS_BIT_GREEN_EN)
 
     @property
     def green_mode_enabled(self) -> bool | None:
