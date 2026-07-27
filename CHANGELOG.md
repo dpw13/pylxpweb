@@ -9,6 +9,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Battery RS485 transport now rejects truncated register responses**:
+  `BatteryModbusTransport._read_registers` returned however many registers
+  pymodbus decoded from the response's own byte count, with no check against
+  the requested count — the same hole closed on the inverter transports in
+  [#203](https://github.com/joyfulhouse/pylxpweb/pull/203). A short read was
+  decoded as if complete, silently producing wrong battery values. A short
+  response is now treated like any other failed read: the runtime block fails
+  the unit for that cycle, and an extra block is dropped whole rather than
+  partially decoded. The next full read recovers normally (no latching —
+  battery block sizes are protocol-fixed, so a short read is truncation, not
+  a firmware-capability signature).
+
+  Dropping a block whole is not the same as reporting no data. `BatteryData`
+  has no nullable cell fields and consumers publish them directly (the Home
+  Assistant integration maps them straight onto sensors), so a dropped master
+  cell block (regs 113-128) reaches users as readings, not as unavailable.
+  It yields `cell_voltages` of sixteen 0.000 V entries; a 0 V min/max
+  wherever the dedicated max/min cell registers 37/38 also read zero; and,
+  through `decode_with_slaves`, a master voltage that reverts to register 22
+  — the bank MINIMUM, not the master's own sum-of-cells.
+
+  The first two are implausible enough to notice, which is the intended
+  trade: a plausible wrong min/max computed over the surviving fragment is
+  replaced by an obvious 0.0. The voltage fallback goes the other way — it
+  swaps an obviously wrong fragment sum for a plausible number that is
+  silently the wrong quantity. Dropping the block is still the right call,
+  but it buys detectability, not correctness. Beyond a DEBUG log line the
+  library gives callers no signal that a block was dropped; bounded per-unit
+  health reporting is tracked in
+  [#248](https://github.com/joyfulhouse/pylxpweb/issues/248).
+
+  The guard also closes a latent cache-poisoning path. `detect_protocol`
+  classifies a unit as master when at most 2 of registers 0-18 are non-zero,
+  and `_get_protocol` caches that verdict for the life of the transport. A
+  runtime read truncated inside that range made a slave look like a master
+  permanently, so every later read of that unit decoded against the wrong
+  register map. A read truncated inside registers 0-18 now returns before
+  detection is reached.
+
+- **Battery RS485 runtime read no longer discards slaves that clamp the
+  read**: the 42-register initial runtime read is a speculative union of both
+  maps — the master map runs to reg 41, the slave map only to reg 38 — so on
+  every slave 3 registers are requested that are never decoded. A BMS that
+  range-clamps a read past its last implemented register instead of answering
+  ILLEGAL DATA ADDRESS would have had a fully decodable 39-register response
+  rejected wholesale, every cycle, turning a working battery into a
+  permanently missing one. The initial read now requires only what the
+  detected protocol actually decodes (39 for slave, 42 for master, derived
+  from the protocol register maps); extra blocks keep the strict
+  requested-count check, since those sizes are protocol-fixed. The floor is
+  itself clamped to at least the 0-18 detection range, so protocol detection
+  only ever runs on data complete through register 18 — a master clamped to
+  39-41 registers is still detected, then rejected against its own
+  requirement.
+  requested-count check, since those sizes are protocol-fixed. The floor
+  stays above the 0-18 detection range, so protocol detection still only ever
+  runs on complete data.
+  decoded as if complete, silently producing wrong battery values (e.g. half
+  a cell-voltage block feeding min/max cell voltage). A short response is now
+  treated like any other failed read for that unit/block: the runtime block
+  fails the unit for that cycle and an extra block is skipped whole, so data
+  is absent rather than wrong, and the next full read recovers normally (no
+  latching — battery block sizes are protocol-fixed, so a short read is
+  truncation, not a firmware-capability signature).
 - **Green mode device helpers work without a cloud client**
   ([#243](https://github.com/joyfulhouse/pylxpweb/issues/243)):
   `BaseInverter.enable_green_mode`, `disable_green_mode` and
