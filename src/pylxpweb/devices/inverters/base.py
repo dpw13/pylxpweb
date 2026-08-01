@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from abc import abstractmethod
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -67,7 +67,7 @@ _SUPPLEMENTAL_FEED_STALE_TTL_FACTOR = 2.5
 
 if TYPE_CHECKING:
     from pylxpweb import LuxpowerClient
-    from pylxpweb.models import EnergyInfo, InverterRuntime, QuickChargeStatus
+    from pylxpweb.models import EnergyInfo, InverterRuntime, QuickChargeStatus, SuccessResponse
     from pylxpweb.transports.protocol import InverterTransport
 
 
@@ -152,6 +152,10 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
         self._parameters_cache_time: datetime | None = None
         self._parameters_cache_ttl = timedelta(hours=1)  # 1-hour TTL for parameters
         self._parameters_cache_lock = asyncio.Lock()
+        # Monotonic invalidation generation. Parameter refreshes snapshot this
+        # before their reads so a write can invalidate an in-flight stale
+        # snapshot without waiting for the (potentially slow) refresh lock.
+        self._parameters_write_seq = 0
 
         # Runtime data cache
         self._runtime_cache_time: datetime | None = None
@@ -202,6 +206,25 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
         if cache_time is None:
             return True
         return (datetime.now() - cache_time) > ttl
+
+    def _invalidate_parameters_cache(self) -> None:
+        """Mark cached parameters stale after a successful device write.
+
+        This guarantees the next refresh RE-READS the device — it does not
+        guarantee that the pre-write value is never served again. ``parameters``
+        still holds the old snapshot, so :meth:`_get_parameter` and the cached
+        properties built on it keep returning the pre-write value until that
+        refresh lands. That is intentional (dropping the snapshot outright would
+        blank every parameter on every control write) and is pinned by tests.
+
+        The generation counter exists so a write that lands mid-refresh cannot
+        be masked: the refresh compares generations and declines to stamp a
+        snapshot that predates the write. Treat the counter as an ordering
+        token only — it is not a write count and nothing should read it as one
+        (some paths bump it more than once for a single logical write).
+        """
+        self._parameters_write_seq += 1
+        self._parameters_cache_time = None
 
     def set_transport_cache_ttls(self) -> None:
         """Adjust cache TTLs based on attached transport type.
@@ -1217,6 +1240,7 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
         - Range 3: Registers 240-366 (extended parameters 2)
         """
         async with self._parameters_cache_lock:
+            write_seq_at_read_start = self._parameters_write_seq
             try:
                 # Link-down guard (#206): the runtime/energy/battery legs of
                 # refresh() gate their transport reads behind
@@ -1291,12 +1315,20 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
                                 ", ".join(failed_ranges),
                             )
                         self.parameters = all_parameters
-                        if not failed_ranges:
+                        if (
+                            not failed_ranges
+                            and self._parameters_write_seq == write_seq_at_read_start
+                        ):
                             # Stamp only a FULLY successful read: a partial
                             # one must retry on the next include_parameters
                             # refresh instead of serving a degraded snapshot
                             # for the whole parameter TTL.
                             self._parameters_cache_time = datetime.now()
+                        elif not failed_ranges:
+                            # A successful write landed after these reads
+                            # began. Keep the installed snapshot explicitly
+                            # stale so the next access re-reads the device.
+                            self._parameters_cache_time = None
                     elif failed_ranges and self.parameters:
                         # Total failure with carried parameters: without this
                         # the staleness signal was silent (#282 review P2).
@@ -1379,10 +1411,17 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
                                 ", ".join(failed_cloud_ranges),
                             )
                         self.parameters = all_parameters
-                        if not failed_cloud_ranges:
+                        if (
+                            not failed_cloud_ranges
+                            and self._parameters_write_seq == write_seq_at_read_start
+                        ):
                             # Stamp only a FULLY successful read (see the
                             # transport path above).
                             self._parameters_cache_time = datetime.now()
+                        elif not failed_cloud_ranges:
+                            # Match the transport branch: a write concurrent
+                            # with these cloud reads invalidates their snapshot.
+                            self._parameters_cache_time = None
                     elif failed_cloud_ranges and self.parameters:
                         # Total failure with carried parameters: without this
                         # the staleness signal was silent (#282 review P2).
@@ -1854,7 +1893,7 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
             try:
                 success = await self._transport.write_parameters(parameters)
                 if success:
-                    self._parameters_cache_time = None
+                    self._invalidate_parameters_cache()
                 return success
             except Exception as err:
                 _LOGGER.warning(
@@ -1884,7 +1923,7 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
 
             # Invalidate parameter cache on successful write
             if response.success:
-                self._parameters_cache_time = None
+                self._invalidate_parameters_cache()
 
             return response.success
 
@@ -1954,7 +1993,7 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
                         current_value,
                         new_value,
                     )
-                    self._parameters_cache_time = None
+                    self._invalidate_parameters_cache()
                 return success
             else:
                 _LOGGER.debug(
@@ -2016,7 +2055,7 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
                     value,
                     self.serial_number,
                 )
-                self._parameters_cache_time = None
+                self._invalidate_parameters_cache()
             return success
         except Exception as err:
             _LOGGER.warning(
@@ -2143,6 +2182,11 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
         Cloud mode writes the raw register value directly (``write_parameters``
         keys by register address), so no name mapping or scaling translation is
         needed — the same raw value used by the transport path is written.
+
+        Both routes invalidate the parameter cache on success (the transport
+        route inside :meth:`write_transport_register`); see
+        :meth:`_invalidate_parameters_cache` for what that does and does not
+        guarantee.
         """
         if self._transport is not None:
             success = await self.write_transport_register(register, value)
@@ -2153,38 +2197,117 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
             return True
         client = self._require_client(register, "write")
         response = await client.api.control.write_parameters(self.serial_number, {register: value})
+        if response.success:
+            self._invalidate_parameters_cache()
         return bool(response.success)
 
     async def _get_register_bit(self, register: int, bit: int) -> bool:
-        """Read a single bit, via transport (raw mask) or cloud (named bool param)."""
-        if self._transport is not None:
-            raw = await self.read_transport_register(register)
-            if raw is None:
-                raise LuxpowerDeviceError(
-                    f"Register {register} read requires a successful Modbus read"
-                )
-            return bool(raw & (1 << bit))
-        client = self._require_client(register, "read")
+        """Read a single bit through its named bool parameter on either route."""
         param_key = self._cloud_param_key(register, bit)
+        if self._transport is not None:
+            from pylxpweb.transports.exceptions import TransportError
+
+            try:
+                parameters = await self._transport.read_named_parameters(register, 1)
+            except TransportError as err:
+                raise LuxpowerDeviceError(
+                    f"Named parameter {param_key} (register {register} bit {bit}) "
+                    "read failed via transport"
+                ) from err
+            if param_key not in parameters:
+                raise LuxpowerDeviceError(
+                    f"Named parameter {param_key} (register {register} bit {bit}) "
+                    "was missing from the transport response"
+                )
+            return bool(parameters[param_key])
+        client = self._require_client(register, "read")
         response = await client.api.control.read_parameters(self.serial_number, register, 1)
         return bool(response.parameters.get(param_key, False))
 
     async def _set_modbus_register_bit(self, register: int, bit: int, enabled: bool) -> bool:
         """Set/clear a single register bit, via transport or cloud.
 
-        Transport mode performs an atomic read-modify-write that preserves the
-        other bits. Cloud mode uses the function-control API, which applies the
-        bit update server-side (also preserving the other bits) — avoiding a
-        read-modify-write race across the slower HTTP round-trip.
+        Transport mode writes the named bit through the transport's lock-held
+        read-modify-write, preserving concurrent changes to other bits. Cloud
+        mode uses the function-control API, which applies the named bit update
+        server-side without a raw-register round trip.
+
+        Both routes invalidate the parameter cache on success, so callers do
+        not have to; see :meth:`_invalidate_parameters_cache` for what that
+        invalidation does and does not guarantee.
         """
         if self._transport is not None:
-            current_value = await self._read_modbus_register(register)
-            new_value = current_value | (1 << bit) if enabled else current_value & ~(1 << bit)
-            return await self._write_modbus_register(register, new_value)
+            from pylxpweb.transports.exceptions import TransportError
+
+            param_key = self._cloud_param_key(register, bit)
+            try:
+                success = await self._transport.write_named_parameters({param_key: enabled})
+            except (TransportError, ValueError) as err:
+                raise LuxpowerDeviceError(
+                    f"Named parameter {param_key} (register {register} bit {bit}) "
+                    "write requires a successful Modbus write"
+                ) from err
+            if not success:
+                raise LuxpowerDeviceError(
+                    f"Named parameter {param_key} (register {register} bit {bit}) "
+                    "write requires a successful Modbus write"
+                )
+            self._invalidate_parameters_cache()
+            return True
         client = self._require_client(register, "write")
         param_key = self._cloud_param_key(register, bit)
         response = await client.api.control.control_function(self.serial_number, param_key, enabled)
+        if response.success:
+            self._invalidate_parameters_cache()
         return bool(response.success)
+
+    async def _set_client_first_function_bit(
+        self,
+        register: int,
+        bit: int,
+        enabled: bool,
+        cloud_write: Callable[[str], Awaitable[SuccessResponse]] | None,
+    ) -> bool:
+        """Set a function bit through cloud first, or a clientless transport.
+
+        A client-bearing inverter uses its historical dedicated endpoint.
+        Otherwise the transport's named-parameter operation holds its lock
+        across the complete read-modify-write.
+
+        ``cloud_write`` is the caller's already-bound enable/disable endpoint,
+        or None when the inverter carries no client — so it doubles as the
+        route selector and there is no unbound-client case to guard against.
+        """
+        from pylxpweb.transports.exceptions import TransportError
+
+        if cloud_write is not None:
+            response = await cloud_write(self.serial_number)
+            success = bool(response.success)
+        else:
+            transport = self._transport
+            if transport is None:
+                raise LuxpowerDeviceError(
+                    f"Register {register} write requires a transport or a cloud client"
+                )
+
+            param_key = self._cloud_param_key(register, bit)
+            try:
+                success = await transport.write_named_parameters({param_key: enabled})
+            except (TransportError, ValueError) as err:
+                raise LuxpowerDeviceError(
+                    f"Named parameter {param_key} (register {register} bit {bit}) "
+                    "write requires a successful Modbus write"
+                ) from err
+            if not success:
+                raise LuxpowerDeviceError(
+                    f"Named parameter {param_key} (register {register} bit {bit}) "
+                    "write requires a successful Modbus write"
+                )
+
+        if success:
+            self._invalidate_parameters_cache()
+
+        return success
 
     def _get_parameter(
         self,
@@ -2199,8 +2322,7 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
 
         **NO API CALLS ARE MADE** - this is purely a cache lookup.
 
-        The cache is automatically refreshed on parameter writes and can be
-        manually invalidated via `self._parameters_cache_time = None`.
+        The cache is automatically invalidated on successful parameter writes.
 
         Helper method to:
         - Reduce code repetition in property accessors
@@ -2282,7 +2404,7 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
             self.serial_number, param_key, str(value)
         )
         if result.success:
-            self._parameters_cache_time = None
+            self._invalidate_parameters_cache()
         return result.success
 
     async def set_standby_mode(self, standby: bool) -> bool:
@@ -2315,9 +2437,12 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
             FUNC_EN_REGISTER, FUNC_EN_BIT_SET_TO_STANDBY, enabled=not standby
         )
 
-        # Invalidate parameter cache on successful write
+        # _set_modbus_register_bit already invalidated on both routes; this
+        # re-invalidation is redundant but harmless (the generation counter is
+        # an ordering token, not a write count) and is kept deliberately so the
+        # invalidation survives any future change to that helper's contract.
         if result:
-            self._parameters_cache_time = None
+            self._invalidate_parameters_cache()
 
         return result
 
@@ -2392,7 +2517,7 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
 
         # Invalidate parameter cache on successful write
         if success:
-            self._parameters_cache_time = None
+            self._invalidate_parameters_cache()
 
         return success
 
@@ -2400,50 +2525,119 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
     # Battery Backup Control (Issue #8)
     # ============================================================================
 
+    async def _set_battery_backup(self, enabled: bool) -> bool:
+        """Set battery backup through cloud, or LOCAL when clientless."""
+        from pylxpweb.constants import FUNC_EN_BIT_EPS_EN, FUNC_EN_REGISTER
+
+        client = self._client
+        cloud_write: Callable[[str], Awaitable[SuccessResponse]] | None = None
+        if client is not None:
+            cloud_write = (
+                client.api.control.enable_battery_backup
+                if enabled
+                else client.api.control.disable_battery_backup
+            )
+        return await self._set_client_first_function_bit(
+            FUNC_EN_REGISTER,
+            FUNC_EN_BIT_EPS_EN,
+            enabled,
+            cloud_write,
+        )
+
     async def enable_battery_backup(self) -> bool:
         """Enable battery backup (EPS) mode.
+
+        Register 21 bit 0 (FUNC_EPS_EN). Routing is client-first: cloud and
+        HYBRID instances keep the dedicated cloud endpoint, while a clientless
+        LOCAL instance uses the transport's lock-held named-parameter RMW.
 
         Universal control: All inverters support EPS mode.
 
         Returns:
-            True if successful
+            True if successful; in cloud mode, False if the API rejected the
+            write
+
+        Raises:
+            LuxpowerDeviceError: If the transport write fails, or if neither
+                a transport nor a cloud client is attached.
 
         Example:
             >>> await inverter.enable_battery_backup()
             True
         """
-        result = await self._client.api.control.enable_battery_backup(self.serial_number)
-        return result.success
+        return await self._set_battery_backup(enabled=True)
 
     async def disable_battery_backup(self) -> bool:
         """Disable battery backup (EPS) mode.
 
+        Register 21 bit 0 (FUNC_EPS_EN). Routing is client-first: cloud and
+        HYBRID instances keep the dedicated cloud endpoint, while a clientless
+        LOCAL instance uses the transport's lock-held named-parameter RMW.
+
         Universal control: All inverters support EPS mode.
 
         Returns:
-            True if successful
+            True if successful; in cloud mode, False if the API rejected the
+            write
+
+        Raises:
+            LuxpowerDeviceError: If the transport write fails, or if neither
+                a transport nor a cloud client is attached.
 
         Example:
             >>> await inverter.disable_battery_backup()
             True
         """
-        result = await self._client.api.control.disable_battery_backup(self.serial_number)
-        return result.success
+        return await self._set_battery_backup(enabled=False)
 
     async def get_battery_backup_status(self) -> bool:
         """Get current battery backup (EPS) mode status.
+
+        Routing is client-first: cloud and HYBRID instances keep the dedicated
+        cloud endpoint; a clientless LOCAL instance reads register 21 bit 0
+        (FUNC_EPS_EN).
 
         Universal control: All inverters support EPS mode.
 
         Returns:
             True if EPS mode is enabled, False otherwise
 
+        Raises:
+            LuxpowerDeviceError: If the transport read fails, or if neither a
+                transport nor a cloud client is attached.
+
         Example:
             >>> is_enabled = await inverter.get_battery_backup_status()
             >>> is_enabled
             True
         """
-        return await self._client.api.control.get_battery_backup_status(self.serial_number)
+        from pylxpweb.constants import FUNC_EN_BIT_EPS_EN, FUNC_EN_REGISTER
+
+        if self._client is not None:
+            return await self._client.api.control.get_battery_backup_status(self.serial_number)
+        return await self._get_register_bit(FUNC_EN_REGISTER, FUNC_EN_BIT_EPS_EN)
+
+    async def _set_battery_backup_ctrl(self, enabled: bool) -> bool:
+        """Set battery backup control through cloud, or LOCAL when clientless."""
+        from pylxpweb.constants import (
+            FUNC_EN_2_BIT_BATTERY_BACKUP_CTRL,
+            FUNC_EN_2_REGISTER,
+        )
+
+        client = self._client
+        cloud_write: Callable[[str], Awaitable[SuccessResponse]] | None = None
+        if client is not None:
+            cloud_write = (
+                client.api.control.enable_battery_backup_ctrl
+                if enabled
+                else client.api.control.disable_battery_backup_ctrl
+            )
+        return await self._set_client_first_function_bit(
+            FUNC_EN_2_REGISTER,
+            FUNC_EN_2_BIT_BATTERY_BACKUP_CTRL,
+            enabled,
+            cloud_write,
+        )
 
     async def enable_battery_backup_ctrl(self) -> bool:
         """Enable battery backup control mode (working mode).
@@ -2456,15 +2650,23 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
 
         Universal control: All inverters support this working mode.
 
+        Register 233 bit 1 (FUNC_BATTERY_BACKUP_CTRL). Routing is client-first:
+        cloud and HYBRID instances keep the dedicated cloud endpoint, while a
+        clientless LOCAL instance uses the transport's lock-held named RMW.
+
         Returns:
-            True if successful
+            True if successful; in cloud mode, False if the API rejected the
+            write
+
+        Raises:
+            LuxpowerDeviceError: If the transport write fails, or if neither
+                a transport nor a cloud client is attached.
 
         Example:
             >>> await inverter.enable_battery_backup_ctrl()
             True
         """
-        result = await self._client.api.control.enable_battery_backup_ctrl(self.serial_number)
-        return result.success
+        return await self._set_battery_backup_ctrl(enabled=True)
 
     async def disable_battery_backup_ctrl(self) -> bool:
         """Disable battery backup control mode (working mode).
@@ -2477,15 +2679,51 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
 
         Universal control: All inverters support this working mode.
 
+        Register 233 bit 1 (FUNC_BATTERY_BACKUP_CTRL). Routing is client-first:
+        cloud and HYBRID instances keep the dedicated cloud endpoint, while a
+        clientless LOCAL instance uses the transport's lock-held named RMW.
+
         Returns:
-            True if successful
+            True if successful; in cloud mode, False if the API rejected the
+            write
+
+        Raises:
+            LuxpowerDeviceError: If the transport write fails, or if neither
+                a transport nor a cloud client is attached.
 
         Example:
             >>> await inverter.disable_battery_backup_ctrl()
             True
         """
-        result = await self._client.api.control.disable_battery_backup_ctrl(self.serial_number)
-        return result.success
+        return await self._set_battery_backup_ctrl(enabled=False)
+
+    async def get_battery_backup_ctrl_status(self) -> bool:
+        """Get current battery backup control status (register 233 bit 1).
+
+        Routing is client-first: cloud and HYBRID instances use the dedicated
+        cloud getter; a clientless LOCAL instance reads
+        FUNC_BATTERY_BACKUP_CTRL through the attached transport.
+
+        Returns:
+            True if battery backup control is enabled, False otherwise.
+
+        Raises:
+            LuxpowerDeviceError: If the transport read fails, or if neither a
+                transport nor a cloud client is attached.
+
+        Example:
+            >>> enabled = await inverter.get_battery_backup_ctrl_status()
+            >>> enabled
+            True
+        """
+        from pylxpweb.constants import (
+            FUNC_EN_2_BIT_BATTERY_BACKUP_CTRL,
+            FUNC_EN_2_REGISTER,
+        )
+
+        if self._client is not None:
+            return await self._client.api.control.get_battery_backup_ctrl_status(self.serial_number)
+        return await self._get_register_bit(FUNC_EN_2_REGISTER, FUNC_EN_2_BIT_BATTERY_BACKUP_CTRL)
 
     # ============================================================================
     # Green Mode Control (Off-Grid Mode in Web Monitor)
@@ -2501,39 +2739,21 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
         parameter API, whose operation lock spans the full read-modify-write.
         """
         from pylxpweb.constants import FUNC_SYS_BIT_GREEN_EN, FUNC_SYS_REGISTER
-        from pylxpweb.transports.exceptions import TransportError
 
         client = self._client
+        cloud_write: Callable[[str], Awaitable[SuccessResponse]] | None = None
         if client is not None:
-            if enabled:
-                response = await client.api.control.enable_green_mode(self.serial_number)
-            else:
-                response = await client.api.control.disable_green_mode(self.serial_number)
-            success = bool(response.success)
-        else:
-            transport = self._transport
-            if transport is None:
-                raise LuxpowerDeviceError(
-                    f"Register {FUNC_SYS_REGISTER} write requires a transport or a cloud client"
-                )
-
-            param_key = self._cloud_param_key(FUNC_SYS_REGISTER, FUNC_SYS_BIT_GREEN_EN)
-            try:
-                success = await transport.write_named_parameters({param_key: enabled})
-            except TransportError as err:
-                raise LuxpowerDeviceError(
-                    f"Register {FUNC_SYS_REGISTER} write requires a successful Modbus write"
-                ) from err
-            if not success:
-                raise LuxpowerDeviceError(
-                    f"Register {FUNC_SYS_REGISTER} write requires a successful Modbus write"
-                )
-
-        # Invalidate parameter cache on successful write
-        if success:
-            self._parameters_cache_time = None
-
-        return success
+            cloud_write = (
+                client.api.control.enable_green_mode
+                if enabled
+                else client.api.control.disable_green_mode
+            )
+        return await self._set_client_first_function_bit(
+            FUNC_SYS_REGISTER,
+            FUNC_SYS_BIT_GREEN_EN,
+            enabled,
+            cloud_write,
+        )
 
     async def enable_green_mode(self) -> bool:
         """Enable green mode (off-grid mode in the web monitoring display).
@@ -3047,99 +3267,201 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
     # Grid Sell Back / Export Controls (GH eg4_web_monitor#135)
     # ============================================================================
 
+    async def _set_feed_in_grid(self, enabled: bool) -> bool:
+        """Set grid feed-in through cloud, or LOCAL when clientless."""
+        from pylxpweb.constants import FUNC_EN_BIT_FEED_IN_GRID_EN, FUNC_EN_REGISTER
+
+        client = self._client
+        cloud_write: Callable[[str], Awaitable[SuccessResponse]] | None = None
+        if client is not None:
+            cloud_write = (
+                client.api.control.enable_feed_in_grid
+                if enabled
+                else client.api.control.disable_feed_in_grid
+            )
+        return await self._set_client_first_function_bit(
+            FUNC_EN_REGISTER,
+            FUNC_EN_BIT_FEED_IN_GRID_EN,
+            enabled,
+            cloud_write,
+        )
+
     async def enable_feed_in_grid(self) -> bool:
         """Enable feed-in to grid ("Grid Sell Back" in the EG4 web UI).
 
         Register 21 bit 15 (FUNC_FEED_IN_GRID_EN), live-verified.
+        Routing is client-first: cloud and HYBRID instances keep the dedicated
+        cloud endpoint, while a clientless LOCAL instance uses the transport's
+        lock-held named-parameter RMW.
 
         Returns:
-            True if successful
+            True if successful; in cloud mode, False if the API rejected the
+            write
+
+        Raises:
+            LuxpowerDeviceError: If the transport write fails, or if neither
+                a transport nor a cloud client is attached.
 
         Example:
             >>> await inverter.enable_feed_in_grid()
             True
         """
-        result = await self._client.api.control.enable_feed_in_grid(self.serial_number)
-        return result.success
+        return await self._set_feed_in_grid(enabled=True)
 
     async def disable_feed_in_grid(self) -> bool:
         """Disable feed-in to grid ("Grid Sell Back" in the EG4 web UI).
 
+        Register 21 bit 15 (FUNC_FEED_IN_GRID_EN). Routing is client-first:
+        cloud and HYBRID instances keep the dedicated cloud endpoint, while a
+        clientless LOCAL instance uses the transport's lock-held named RMW.
+
         Returns:
-            True if successful
+            True if successful; in cloud mode, False if the API rejected the
+            write
+
+        Raises:
+            LuxpowerDeviceError: If the transport write fails, or if neither
+                a transport nor a cloud client is attached.
 
         Example:
             >>> await inverter.disable_feed_in_grid()
             True
         """
-        result = await self._client.api.control.disable_feed_in_grid(self.serial_number)
-        return result.success
+        return await self._set_feed_in_grid(enabled=False)
 
     async def get_feed_in_grid_status(self) -> bool:
         """Get current feed-in grid (Grid Sell Back) status.
 
+        Routing is client-first: cloud and HYBRID instances keep the dedicated
+        cloud endpoint; a clientless LOCAL instance reads register 21 bit 15
+        (FUNC_FEED_IN_GRID_EN).
+
         Returns:
             True if feed-in to grid is enabled, False otherwise
+
+        Raises:
+            LuxpowerDeviceError: If the transport read fails, or if neither a
+                transport nor a cloud client is attached.
 
         Example:
             >>> is_enabled = await inverter.get_feed_in_grid_status()
             >>> is_enabled
             True
         """
-        return await self._client.api.control.get_feed_in_grid_status(self.serial_number)
+        from pylxpweb.constants import FUNC_EN_BIT_FEED_IN_GRID_EN, FUNC_EN_REGISTER
+
+        if self._client is not None:
+            return await self._client.api.control.get_feed_in_grid_status(self.serial_number)
+        return await self._get_register_bit(FUNC_EN_REGISTER, FUNC_EN_BIT_FEED_IN_GRID_EN)
+
+    async def _set_pv_sell_to_grid(self, enabled: bool) -> bool:
+        """Set PV sell-to-grid through cloud, or LOCAL when clientless."""
+        from pylxpweb.constants import FUNC_EXT_BIT_PV_SELL_TO_GRID, FUNC_EXT_REGISTER
+
+        client = self._client
+        cloud_write: Callable[[str], Awaitable[SuccessResponse]] | None = None
+        if client is not None:
+            cloud_write = (
+                client.api.control.enable_pv_sell_to_grid
+                if enabled
+                else client.api.control.disable_pv_sell_to_grid
+            )
+        return await self._set_client_first_function_bit(
+            FUNC_EXT_REGISTER,
+            FUNC_EXT_BIT_PV_SELL_TO_GRID,
+            enabled,
+            cloud_write,
+        )
 
     async def enable_pv_sell_to_grid(self) -> bool:
         """Enable PV sell to grid ("Export PV Only" in the EG4 web UI).
 
-        Cloud (HTTP) path: FUNC_PV_SELL_TO_GRID_EN — register 179 bit 3,
-        pinned 2026-06-12 via live cloud toggles raw-verified on both a
-        FlexBOSS21 (52842P0581) and an 18kPV (4512670118): raw 0x104c <->
-        0x1044, single-bit-3 XOR.  :class:`HybridInverter` overrides this
-        with the dual-path read-modify-write that also supports local
-        transports; local register decode surfaces the bit by name either
-        way.
+        Register 179 bit 3 (FUNC_PV_SELL_TO_GRID_EN), pinned by the existing
+        live-toggle evidence. Base routing is client-first: cloud instances
+        keep the dedicated endpoint, and a clientless LOCAL instance uses the
+        transport's lock-held named RMW. :class:`HybridInverter` overrides this
+        method and remains transport-first when both routes are attached.
 
         Returns:
-            True if successful
+            True if successful; in cloud mode, False if the API rejected the
+            write
+
+        Raises:
+            LuxpowerDeviceError: If the transport write fails, or if neither
+                a transport nor a cloud client is attached.
 
         Example:
             >>> await inverter.enable_pv_sell_to_grid()
             True
         """
-        result = await self._client.api.control.enable_pv_sell_to_grid(self.serial_number)
-        return result.success
+        return await self._set_pv_sell_to_grid(enabled=True)
 
     async def disable_pv_sell_to_grid(self) -> bool:
         """Disable PV sell to grid ("Export PV Only" in the EG4 web UI).
 
-        Cloud (HTTP) path; see :meth:`enable_pv_sell_to_grid` for the
-        register 179 bit 3 pin and the HybridInverter dual-path override.
+        Register 179 bit 3 (FUNC_PV_SELL_TO_GRID_EN). Base routing is
+        client-first: cloud instances keep the dedicated endpoint, and a
+        clientless LOCAL instance uses the transport's lock-held named RMW.
+        :class:`HybridInverter` keeps its transport-first override.
 
         Returns:
-            True if successful
+            True if successful; in cloud mode, False if the API rejected the
+            write
+
+        Raises:
+            LuxpowerDeviceError: If the transport write fails, or if neither
+                a transport nor a cloud client is attached.
 
         Example:
             >>> await inverter.disable_pv_sell_to_grid()
             True
         """
-        result = await self._client.api.control.disable_pv_sell_to_grid(self.serial_number)
-        return result.success
+        return await self._set_pv_sell_to_grid(enabled=False)
 
     async def get_pv_sell_to_grid_status(self) -> bool:
         """Get current PV sell to grid (Export PV Only) status.
 
-        Cloud (HTTP) path; see :meth:`enable_pv_sell_to_grid` for the
-        register 179 bit 3 pin and the HybridInverter dual-path override.
+        Base routing is client-first: a cloud instance keeps the dedicated
+        endpoint; a clientless LOCAL instance reads register 179 bit 3
+        (FUNC_PV_SELL_TO_GRID_EN). :class:`HybridInverter` keeps its
+        transport-first override.
 
         Returns:
             True if Export PV Only is enabled, False otherwise
+
+        Raises:
+            LuxpowerDeviceError: If the transport read fails, or if neither a
+                transport nor a cloud client is attached.
 
         Example:
             >>> is_enabled = await inverter.get_pv_sell_to_grid_status()
             >>> is_enabled
             True
         """
-        return await self._client.api.control.get_pv_sell_to_grid_status(self.serial_number)
+        from pylxpweb.constants import FUNC_EXT_BIT_PV_SELL_TO_GRID, FUNC_EXT_REGISTER
+
+        if self._client is not None:
+            return await self._client.api.control.get_pv_sell_to_grid_status(self.serial_number)
+        return await self._get_register_bit(FUNC_EXT_REGISTER, FUNC_EXT_BIT_PV_SELL_TO_GRID)
+
+    async def _set_fast_zero_export(self, enabled: bool) -> bool:
+        """Set Fast Zero Export through cloud, or LOCAL when clientless."""
+        from pylxpweb.constants import FUNC_SYS_BIT_RUN_WITHOUT_GRID, FUNC_SYS_REGISTER
+
+        client = self._client
+        cloud_write: Callable[[str], Awaitable[SuccessResponse]] | None = None
+        if client is not None:
+            cloud_write = (
+                client.api.control.enable_fast_zero_export
+                if enabled
+                else client.api.control.disable_fast_zero_export
+            )
+        return await self._set_client_first_function_bit(
+            FUNC_SYS_REGISTER,
+            FUNC_SYS_BIT_RUN_WITHOUT_GRID,
+            enabled,
+            cloud_write,
+        )
 
     async def enable_fast_zero_export(self) -> bool:
         """Enable Fast Zero Export ("Fast Zero Export" in both web UIs).
@@ -3151,43 +3473,69 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
         control loop (import control slows down); the vendors advise
         selecting it as the opposite of Grid Sell Back.
 
+        Routing is client-first: cloud and HYBRID instances keep the dedicated
+        cloud endpoint, while a clientless LOCAL instance uses the transport's
+        lock-held named-parameter RMW for register 110 bit 1.
+
         Returns:
-            True if successful
+            True if successful; in cloud mode, False if the API rejected the
+            write
+
+        Raises:
+            LuxpowerDeviceError: If the transport write fails, or if neither
+                a transport nor a cloud client is attached.
 
         Example:
             >>> await inverter.enable_fast_zero_export()
             True
         """
-        result = await self._client.api.control.enable_fast_zero_export(self.serial_number)
-        return result.success
+        return await self._set_fast_zero_export(enabled=True)
 
     async def disable_fast_zero_export(self) -> bool:
         """Disable Fast Zero Export.
 
-        See :meth:`enable_fast_zero_export` for the register 110 bit 1 pin.
+        Register 110 bit 1 (FUNC_RUN_WITHOUT_GRID). Routing is client-first:
+        cloud and HYBRID instances keep the dedicated cloud endpoint, while a
+        clientless LOCAL instance uses the transport's lock-held named RMW.
 
         Returns:
-            True if successful
+            True if successful; in cloud mode, False if the API rejected the
+            write
+
+        Raises:
+            LuxpowerDeviceError: If the transport write fails, or if neither
+                a transport nor a cloud client is attached.
 
         Example:
             >>> await inverter.disable_fast_zero_export()
             True
         """
-        result = await self._client.api.control.disable_fast_zero_export(self.serial_number)
-        return result.success
+        return await self._set_fast_zero_export(enabled=False)
 
     async def get_fast_zero_export_status(self) -> bool:
         """Get current Fast Zero Export status (register 110 bit 1).
 
+        Routing is client-first: cloud and HYBRID instances keep the dedicated
+        cloud endpoint; a clientless LOCAL instance reads register 110 bit 1
+        (FUNC_RUN_WITHOUT_GRID).
+
         Returns:
             True if Fast Zero Export is enabled, False otherwise
+
+        Raises:
+            LuxpowerDeviceError: If the transport read fails, or if neither a
+                transport nor a cloud client is attached.
 
         Example:
             >>> is_enabled = await inverter.get_fast_zero_export_status()
             >>> is_enabled
             True
         """
-        return await self._client.api.control.get_fast_zero_export_status(self.serial_number)
+        from pylxpweb.constants import FUNC_SYS_BIT_RUN_WITHOUT_GRID, FUNC_SYS_REGISTER
+
+        if self._client is not None:
+            return await self._client.api.control.get_fast_zero_export_status(self.serial_number)
+        return await self._get_register_bit(FUNC_SYS_REGISTER, FUNC_SYS_BIT_RUN_WITHOUT_GRID)
 
     async def set_feed_in_grid_power_kw(self, power_kw: float) -> bool:
         """Set the maximum sell-back (feed-in) power in kilowatts (register 103).
@@ -3222,7 +3570,7 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
         )
 
         if result.success:
-            self._parameters_cache_time = None
+            self._invalidate_parameters_cache()
 
         return result.success
 
@@ -3349,7 +3697,7 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
 
         # Invalidate parameter cache on successful write
         if result.success:
-            self._parameters_cache_time = None
+            self._invalidate_parameters_cache()
 
         return result.success
 
@@ -3377,7 +3725,7 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
 
         # Invalidate parameter cache on successful write
         if result.success:
-            self._parameters_cache_time = None
+            self._invalidate_parameters_cache()
 
         return result.success
 
@@ -3522,7 +3870,7 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
 
         # Invalidate parameter cache on successful write
         if result:
-            self._parameters_cache_time = None
+            self._invalidate_parameters_cache()
 
         return result
 
@@ -3646,7 +3994,7 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
         if reg is not None:
             try:
                 if await transport.write_parameters({233: reg | 0x1, 234: minute}):
-                    self._parameters_cache_time = None
+                    self._invalidate_parameters_cache()
                     return True
             except Exception as err:
                 _LOGGER.debug(
@@ -3856,185 +4204,373 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
     # Working Mode Controls (Issue #16)
     # ============================================================================
 
+    async def _set_ac_charge_mode(self, enabled: bool) -> bool:
+        """Set AC charge mode through cloud, or LOCAL when clientless."""
+        from pylxpweb.constants import FUNC_EN_BIT_AC_CHARGE_EN, FUNC_EN_REGISTER
+
+        client = self._client
+        cloud_write: Callable[[str], Awaitable[SuccessResponse]] | None = None
+        if client is not None:
+            cloud_write = (
+                client.api.control.enable_ac_charge_mode
+                if enabled
+                else client.api.control.disable_ac_charge_mode
+            )
+        return await self._set_client_first_function_bit(
+            FUNC_EN_REGISTER,
+            FUNC_EN_BIT_AC_CHARGE_EN,
+            enabled,
+            cloud_write,
+        )
+
     async def enable_ac_charge_mode(self) -> bool:
         """Enable AC charge mode to allow battery charging from grid.
+
+        Register 21 bit 7 (FUNC_AC_CHARGE). Routing is client-first: cloud and
+        HYBRID instances keep the dedicated cloud endpoint, while a clientless
+        LOCAL instance uses the transport's lock-held named-parameter RMW.
 
         Universal control: All inverters support AC charging.
 
         Returns:
-            True if successful
+            True if successful; in cloud mode, False if the API rejected the
+            write
+
+        Raises:
+            LuxpowerDeviceError: If the transport write fails, or if neither
+                a transport nor a cloud client is attached.
 
         Example:
             >>> await inverter.enable_ac_charge_mode()
             True
         """
-        result = await self._client.api.control.enable_ac_charge_mode(self.serial_number)
-        return result.success
+        return await self._set_ac_charge_mode(enabled=True)
 
     async def disable_ac_charge_mode(self) -> bool:
         """Disable AC charge mode.
 
+        Register 21 bit 7 (FUNC_AC_CHARGE). Routing is client-first: cloud and
+        HYBRID instances keep the dedicated cloud endpoint, while a clientless
+        LOCAL instance uses the transport's lock-held named-parameter RMW.
+
         Universal control: All inverters support AC charging.
 
         Returns:
-            True if successful
+            True if successful; in cloud mode, False if the API rejected the
+            write
+
+        Raises:
+            LuxpowerDeviceError: If the transport write fails, or if neither
+                a transport nor a cloud client is attached.
 
         Example:
             >>> await inverter.disable_ac_charge_mode()
             True
         """
-        result = await self._client.api.control.disable_ac_charge_mode(self.serial_number)
-        return result.success
+        return await self._set_ac_charge_mode(enabled=False)
 
     async def get_ac_charge_mode_status(self) -> bool:
         """Get current AC charge mode status.
+
+        Routing is client-first: cloud and HYBRID instances keep the dedicated
+        cloud endpoint; a clientless LOCAL instance reads register 21 bit 7
+        (FUNC_AC_CHARGE).
 
         Universal control: All inverters support AC charging.
 
         Returns:
             True if AC charge mode is enabled, False otherwise
 
+        Raises:
+            LuxpowerDeviceError: If the transport read fails, or if neither a
+                transport nor a cloud client is attached.
+
         Example:
             >>> is_enabled = await inverter.get_ac_charge_mode_status()
             >>> is_enabled
             True
         """
-        return await self._client.api.control.get_ac_charge_mode_status(self.serial_number)
+        from pylxpweb.constants import FUNC_EN_BIT_AC_CHARGE_EN, FUNC_EN_REGISTER
+
+        if self._client is not None:
+            return await self._client.api.control.get_ac_charge_mode_status(self.serial_number)
+        return await self._get_register_bit(FUNC_EN_REGISTER, FUNC_EN_BIT_AC_CHARGE_EN)
+
+    async def _set_pv_charge_priority(self, enabled: bool) -> bool:
+        """Set PV charge priority through cloud, or LOCAL when clientless."""
+        from pylxpweb.constants import FUNC_EN_BIT_FORCED_CHG_EN, FUNC_EN_REGISTER
+
+        client = self._client
+        cloud_write: Callable[[str], Awaitable[SuccessResponse]] | None = None
+        if client is not None:
+            cloud_write = (
+                client.api.control.enable_pv_charge_priority
+                if enabled
+                else client.api.control.disable_pv_charge_priority
+            )
+        return await self._set_client_first_function_bit(
+            FUNC_EN_REGISTER,
+            FUNC_EN_BIT_FORCED_CHG_EN,
+            enabled,
+            cloud_write,
+        )
 
     async def enable_pv_charge_priority(self) -> bool:
         """Enable PV charge priority mode during specified hours.
 
+        Register 21 bit 11 (FUNC_FORCED_CHG_EN). Routing is client-first:
+        cloud and HYBRID instances keep the dedicated cloud endpoint, while a
+        clientless LOCAL instance uses the transport's lock-held named RMW.
+
         Universal control: All inverters support forced charge.
 
         Returns:
-            True if successful
+            True if successful; in cloud mode, False if the API rejected the
+            write
+
+        Raises:
+            LuxpowerDeviceError: If the transport write fails, or if neither
+                a transport nor a cloud client is attached.
 
         Example:
             >>> await inverter.enable_pv_charge_priority()
             True
         """
-        result = await self._client.api.control.enable_pv_charge_priority(self.serial_number)
-        return result.success
+        return await self._set_pv_charge_priority(enabled=True)
 
     async def disable_pv_charge_priority(self) -> bool:
         """Disable PV charge priority mode.
 
+        Register 21 bit 11 (FUNC_FORCED_CHG_EN). Routing is client-first:
+        cloud and HYBRID instances keep the dedicated cloud endpoint, while a
+        clientless LOCAL instance uses the transport's lock-held named RMW.
+
         Universal control: All inverters support forced charge.
 
         Returns:
-            True if successful
+            True if successful; in cloud mode, False if the API rejected the
+            write
+
+        Raises:
+            LuxpowerDeviceError: If the transport write fails, or if neither
+                a transport nor a cloud client is attached.
 
         Example:
             >>> await inverter.disable_pv_charge_priority()
             True
         """
-        result = await self._client.api.control.disable_pv_charge_priority(self.serial_number)
-        return result.success
+        return await self._set_pv_charge_priority(enabled=False)
 
     async def get_pv_charge_priority_status(self) -> bool:
         """Get current PV charge priority status.
+
+        Routing is client-first: cloud and HYBRID instances keep the dedicated
+        cloud endpoint; a clientless LOCAL instance reads register 21 bit 11
+        (FUNC_FORCED_CHG_EN).
 
         Universal control: All inverters support forced charge.
 
         Returns:
             True if PV charge priority is enabled, False otherwise
 
+        Raises:
+            LuxpowerDeviceError: If the transport read fails, or if neither a
+                transport nor a cloud client is attached.
+
         Example:
             >>> is_enabled = await inverter.get_pv_charge_priority_status()
             >>> is_enabled
             True
         """
-        return await self._client.api.control.get_pv_charge_priority_status(self.serial_number)
+        from pylxpweb.constants import FUNC_EN_BIT_FORCED_CHG_EN, FUNC_EN_REGISTER
+
+        if self._client is not None:
+            return await self._client.api.control.get_pv_charge_priority_status(self.serial_number)
+        return await self._get_register_bit(FUNC_EN_REGISTER, FUNC_EN_BIT_FORCED_CHG_EN)
+
+    async def _set_forced_discharge(self, enabled: bool) -> bool:
+        """Set forced discharge through cloud, or LOCAL when clientless."""
+        from pylxpweb.constants import FUNC_EN_BIT_FORCED_DISCHG_EN, FUNC_EN_REGISTER
+
+        client = self._client
+        cloud_write: Callable[[str], Awaitable[SuccessResponse]] | None = None
+        if client is not None:
+            cloud_write = (
+                client.api.control.enable_forced_discharge
+                if enabled
+                else client.api.control.disable_forced_discharge
+            )
+        return await self._set_client_first_function_bit(
+            FUNC_EN_REGISTER,
+            FUNC_EN_BIT_FORCED_DISCHG_EN,
+            enabled,
+            cloud_write,
+        )
 
     async def enable_forced_discharge(self) -> bool:
         """Enable forced discharge mode for grid export.
 
+        Register 21 bit 10 (FUNC_FORCED_DISCHG_EN). Routing is client-first:
+        cloud and HYBRID instances keep the dedicated cloud endpoint, while a
+        clientless LOCAL instance uses the transport's lock-held named RMW.
+
         Universal control: All inverters support forced discharge.
 
         Returns:
-            True if successful
+            True if successful; in cloud mode, False if the API rejected the
+            write
+
+        Raises:
+            LuxpowerDeviceError: If the transport write fails, or if neither
+                a transport nor a cloud client is attached.
 
         Example:
             >>> await inverter.enable_forced_discharge()
             True
         """
-        result = await self._client.api.control.enable_forced_discharge(self.serial_number)
-        return result.success
+        return await self._set_forced_discharge(enabled=True)
 
     async def disable_forced_discharge(self) -> bool:
         """Disable forced discharge mode.
 
+        Register 21 bit 10 (FUNC_FORCED_DISCHG_EN). Routing is client-first:
+        cloud and HYBRID instances keep the dedicated cloud endpoint, while a
+        clientless LOCAL instance uses the transport's lock-held named RMW.
+
         Universal control: All inverters support forced discharge.
 
         Returns:
-            True if successful
+            True if successful; in cloud mode, False if the API rejected the
+            write
+
+        Raises:
+            LuxpowerDeviceError: If the transport write fails, or if neither
+                a transport nor a cloud client is attached.
 
         Example:
             >>> await inverter.disable_forced_discharge()
             True
         """
-        result = await self._client.api.control.disable_forced_discharge(self.serial_number)
-        return result.success
+        return await self._set_forced_discharge(enabled=False)
 
     async def get_forced_discharge_status(self) -> bool:
         """Get current forced discharge status.
+
+        Routing is client-first: cloud and HYBRID instances keep the dedicated
+        cloud endpoint; a clientless LOCAL instance reads register 21 bit 10
+        (FUNC_FORCED_DISCHG_EN).
 
         Universal control: All inverters support forced discharge.
 
         Returns:
             True if forced discharge is enabled, False otherwise
 
+        Raises:
+            LuxpowerDeviceError: If the transport read fails, or if neither a
+                transport nor a cloud client is attached.
+
         Example:
             >>> is_enabled = await inverter.get_forced_discharge_status()
             >>> is_enabled
             True
         """
-        return await self._client.api.control.get_forced_discharge_status(self.serial_number)
+        from pylxpweb.constants import FUNC_EN_BIT_FORCED_DISCHG_EN, FUNC_EN_REGISTER
+
+        if self._client is not None:
+            return await self._client.api.control.get_forced_discharge_status(self.serial_number)
+        return await self._get_register_bit(FUNC_EN_REGISTER, FUNC_EN_BIT_FORCED_DISCHG_EN)
+
+    async def _set_peak_shaving_mode(self, enabled: bool) -> bool:
+        """Set peak shaving through cloud, or LOCAL when clientless."""
+        from pylxpweb.constants import FUNC_EXT_BIT_GRID_PEAK_SHAVING, FUNC_EXT_REGISTER
+
+        client = self._client
+        cloud_write: Callable[[str], Awaitable[SuccessResponse]] | None = None
+        if client is not None:
+            cloud_write = (
+                client.api.control.enable_peak_shaving_mode
+                if enabled
+                else client.api.control.disable_peak_shaving_mode
+            )
+        return await self._set_client_first_function_bit(
+            FUNC_EXT_REGISTER,
+            FUNC_EXT_BIT_GRID_PEAK_SHAVING,
+            enabled,
+            cloud_write,
+        )
 
     async def enable_peak_shaving_mode(self) -> bool:
         """Enable grid peak shaving mode.
 
+        Register 179 bit 7 (FUNC_GRID_PEAK_SHAVING). Routing is client-first:
+        cloud and HYBRID instances keep the dedicated cloud endpoint, while a
+        clientless LOCAL instance uses the transport's lock-held named RMW.
+
         Universal control: Most inverters support peak shaving.
 
         Returns:
-            True if successful
+            True if successful; in cloud mode, False if the API rejected the
+            write
+
+        Raises:
+            LuxpowerDeviceError: If the transport write fails, or if neither
+                a transport nor a cloud client is attached.
 
         Example:
             >>> await inverter.enable_peak_shaving_mode()
             True
         """
-        result = await self._client.api.control.enable_peak_shaving_mode(self.serial_number)
-        return result.success
+        return await self._set_peak_shaving_mode(enabled=True)
 
     async def disable_peak_shaving_mode(self) -> bool:
         """Disable grid peak shaving mode.
 
+        Register 179 bit 7 (FUNC_GRID_PEAK_SHAVING). Routing is client-first:
+        cloud and HYBRID instances keep the dedicated cloud endpoint, while a
+        clientless LOCAL instance uses the transport's lock-held named RMW.
+
         Universal control: Most inverters support peak shaving.
 
         Returns:
-            True if successful
+            True if successful; in cloud mode, False if the API rejected the
+            write
+
+        Raises:
+            LuxpowerDeviceError: If the transport write fails, or if neither
+                a transport nor a cloud client is attached.
 
         Example:
             >>> await inverter.disable_peak_shaving_mode()
             True
         """
-        result = await self._client.api.control.disable_peak_shaving_mode(self.serial_number)
-        return result.success
+        return await self._set_peak_shaving_mode(enabled=False)
 
     async def get_peak_shaving_mode_status(self) -> bool:
         """Get current peak shaving mode status.
+
+        Routing is client-first: cloud and HYBRID instances keep the dedicated
+        cloud endpoint; a clientless LOCAL instance reads register 179 bit 7
+        (FUNC_GRID_PEAK_SHAVING).
 
         Universal control: Most inverters support peak shaving.
 
         Returns:
             True if peak shaving mode is enabled, False otherwise
 
+        Raises:
+            LuxpowerDeviceError: If the transport read fails, or if neither a
+                transport nor a cloud client is attached.
+
         Example:
             >>> is_enabled = await inverter.get_peak_shaving_mode_status()
             >>> is_enabled
             True
         """
-        return await self._client.api.control.get_peak_shaving_mode_status(self.serial_number)
+        from pylxpweb.constants import FUNC_EXT_BIT_GRID_PEAK_SHAVING, FUNC_EXT_REGISTER
+
+        if self._client is not None:
+            return await self._client.api.control.get_peak_shaving_mode_status(self.serial_number)
+        return await self._get_register_bit(FUNC_EXT_REGISTER, FUNC_EXT_BIT_GRID_PEAK_SHAVING)
 
     # ============================================================================
     # Feature Detection (Model-Based Capabilities)

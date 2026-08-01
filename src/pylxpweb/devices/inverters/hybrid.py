@@ -143,16 +143,21 @@ class HybridInverter(GenericInverter):
         # transport does an atomic reg-21 read-modify-write, the cloud applies
         # the bit server-side via control_function. The old raw reg-21 write was
         # rejected by the cloud (reg 21 is a bitfield), silently no-opping.
+        # The falsy guard is live only on the cloud route, which returns
+        # False when the API rejects the write; the transport route now
+        # returns True or raises. Kept so a cloud rejection still short-
+        # circuits before the value writes below.
         if not await self._set_modbus_register_bit(
             FUNC_EN_REGISTER, FUNC_EN_BIT_AC_CHARGE_EN, enabled
         ):
             return False
 
-        # The enable bit has changed device state; invalidate the parameter
-        # cache now so that a later value-write failure below cannot leave
-        # refresh(include_parameters=True) serving a stale reg-21 for up to the
-        # parameter TTL (cloud endpoint invalidation does not clear this cache).
-        self._parameters_cache_time = None
+        # _set_modbus_register_bit already invalidated on both routes; this
+        # re-invalidation is redundant but harmless (the generation counter is
+        # an ordering token, not a write count) and is kept as a local
+        # guarantee that a value-write failure below cannot leave
+        # refresh(include_parameters=True) serving a stale reg-21.
+        self._invalidate_parameters_cache()
 
         # Power and SOC limit are value registers; write them by address so the
         # cloud path resolves the named param + scaling (behaviour unchanged).
@@ -789,7 +794,7 @@ class HybridInverter(GenericInverter):
             result = bool(response.success)
 
         if result:
-            self._parameters_cache_time = None
+            self._invalidate_parameters_cache()
 
         return result
 
@@ -1186,16 +1191,21 @@ class HybridInverter(GenericInverter):
     async def set_pv_sell_to_grid(self, enabled: bool) -> bool:
         """Enable or disable PV sell to grid ("Export PV Only").
 
-        Transport mode performs a read-modify-write on register 179 that
-        preserves the other function bits from the read value (a read
-        followed by a write — the same non-atomic sequence as bits 9/10);
-        cloud mode applies the bit server-side via the function-control API.
+        Routing is transport-first: when a transport is attached, its
+        lock-held named-parameter RMW updates register 179 bit 3 atomically
+        relative to other transport operations. Without a transport, the
+        cloud function-control API applies the named bit server-side.
 
         Args:
             enabled: True to only export PV surplus (never battery)
 
         Returns:
-            True if successful
+            True if successful; in cloud mode, False if the API rejected the
+            write.
+
+        Raises:
+            LuxpowerDeviceError: If the transport write fails, or if neither
+                a transport nor a cloud client is attached.
 
         Example:
             >>> await inverter.set_pv_sell_to_grid(True)
@@ -1210,12 +1220,17 @@ class HybridInverter(GenericInverter):
     async def enable_pv_sell_to_grid(self) -> bool:
         """Enable PV sell to grid ("Export PV Only" in the EG4 web UI).
 
-        Dual-path override of the cloud-only BaseInverter method: register
-        179 bit 3 read-modify-write over the transport, or the atomic cloud
-        function-control update without one.
+        This override deliberately remains transport-first. An attached
+        transport uses its lock-held named RMW for register 179 bit 3;
+        without one, the cloud applies the named bit server-side.
 
         Returns:
-            True if successful
+            True if successful; in cloud mode, False if the API rejected the
+            write.
+
+        Raises:
+            LuxpowerDeviceError: If the transport write fails, or if neither
+                a transport nor a cloud client is attached.
 
         Example:
             >>> await inverter.enable_pv_sell_to_grid()
@@ -1226,8 +1241,17 @@ class HybridInverter(GenericInverter):
     async def disable_pv_sell_to_grid(self) -> bool:
         """Disable PV sell to grid ("Export PV Only" in the EG4 web UI).
 
+        This override deliberately remains transport-first. An attached
+        transport uses its lock-held named RMW for register 179 bit 3;
+        without one, the cloud applies the named bit server-side.
+
         Returns:
-            True if successful
+            True if successful; in cloud mode, False if the API rejected the
+            write.
+
+        Raises:
+            LuxpowerDeviceError: If the transport write fails, or if neither
+                a transport nor a cloud client is attached.
 
         Example:
             >>> await inverter.disable_pv_sell_to_grid()

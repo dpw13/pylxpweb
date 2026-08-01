@@ -199,19 +199,28 @@ class TestBulkDeviceData:
 
         mock_overview.rows = [mock_device1, mock_device2]
 
-        # Track call times to verify concurrency
-        call_times: list[float] = []
+        # Track each gather group's overlap independently. A global peak would
+        # miss a half-sequential regression where runtime still fans out but
+        # battery calls are accidentally serialized (or vice versa).
+        calls: list[str] = []
+        in_flight = {"runtime": 0, "battery": 0}
+        peak_in_flight = {"runtime": 0, "battery": 0}
+
+        async def record_concurrent_call(group: str, serial: str) -> None:
+            calls.append(serial)
+            in_flight[group] += 1
+            peak_in_flight[group] = max(peak_in_flight[group], in_flight[group])
+            await asyncio.sleep(0.01)  # Simulate API delay
+            in_flight[group] -= 1
 
         async def mock_runtime_call(serial: str) -> Mock:
-            call_times.append(asyncio.get_event_loop().time())
-            await asyncio.sleep(0.01)  # Simulate API delay
+            await record_concurrent_call("runtime", serial)
             mock = Mock(spec=InverterRuntime)
             mock.serialNum = serial
             return mock
 
         async def mock_battery_call(serial: str) -> Mock:
-            call_times.append(asyncio.get_event_loop().time())
-            await asyncio.sleep(0.01)  # Simulate API delay
+            await record_concurrent_call("battery", serial)
             mock = Mock(spec=BatteryInfo)
             mock.serialNum = serial
             return mock
@@ -222,15 +231,10 @@ class TestBulkDeviceData:
         devices_endpoint.get_battery_info = AsyncMock(side_effect=mock_battery_call)
 
         # Call get_all_device_data
-        start_time = asyncio.get_event_loop().time()
         await devices_endpoint.get_all_device_data(12345)
-        end_time = asyncio.get_event_loop().time()
 
-        # Verify calls were made concurrently (not sequentially)
-        # If sequential: 4 calls * 0.01s = 0.04s minimum
-        # If concurrent: 2 parallel groups * 0.01s = 0.02s minimum
-        total_time = end_time - start_time
-        assert total_time < 0.03, f"Calls appear to be sequential: {total_time}s"
+        # Both sequential gather groups must fan out over both devices.
+        assert peak_in_flight == {"runtime": 2, "battery": 2}
 
         # Verify all 4 calls were made (2 runtime + 2 battery)
-        assert len(call_times) == 4
+        assert len(calls) == 4
