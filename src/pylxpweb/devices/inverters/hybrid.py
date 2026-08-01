@@ -9,13 +9,17 @@ This module provides the HybridInverter class for hybrid inverters that support:
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any
 
 from pylxpweb.constants import ScheduleType
 from pylxpweb.exceptions import LuxpowerDeviceError
 from pylxpweb.models import BatteryControlMode
 
 from .generic import GenericInverter
+
+if TYPE_CHECKING:
+    from pylxpweb.models import SuccessResponse
 
 
 class HybridInverter(GenericInverter):
@@ -1156,6 +1160,70 @@ class HybridInverter(GenericInverter):
             else await self.get_on_grid_cutoff_soc()
         )
         return {"mode": mode, "value": soc_value, "unit": "%"}
+
+    # ============================================================================
+    # AC Couple Operations (GH eg4_web_monitor#472)
+    # ============================================================================
+    # Register 179 bit 11 (FUNC_AC_COUPLING_FUNCTION). This local path ships
+    # on the lineage evidence recorded in constants/registers.py; the strict
+    # raw↔named lockstep toggle remains an outstanding #472 capture. These
+    # overrides give the cloud-only BaseInverter methods the same dual-path
+    # dispatch used by the other register-179 function controls.
+
+    async def get_ac_couple_status(self) -> bool:
+        """Get the inverter-level AC couple function status.
+
+        Reads register 179 bit 11 via the transport when one is attached,
+        otherwise via the cloud named-parameter read.
+
+        Returns:
+            True if AC coupling is enabled, False otherwise
+        """
+        from pylxpweb.constants import FUNC_EXT_BIT_AC_COUPLING, FUNC_EXT_REGISTER
+
+        return await self._get_register_bit(FUNC_EXT_REGISTER, FUNC_EXT_BIT_AC_COUPLING)
+
+    async def set_ac_couple(self, enabled: bool) -> bool:
+        """Enable or disable the inverter-level AC couple function.
+
+        Transport-FIRST, unlike the client-first base: an attached transport
+        writes the named bit through the transport's lock-held
+        read-modify-write, and only a transport-less instance falls back to
+        the cloud endpoint.
+
+        The lock matters here specifically. Register 179 already carried one
+        local writer (Grid Peak Shaving, bit 7); bit 11 makes two, and a raw
+        read-modify-write drops whichever bit lands between the two writers'
+        read and write — reproduced as a lost bit 7 (pylxpweb#254, which put
+        the whole library on the lock-held named write). Passing
+        ``cloud_write=None`` selects that route here.
+
+        Args:
+            enabled: True to enable AC coupling, False to disable it
+
+        Returns:
+            True if successful
+
+        Raises:
+            LuxpowerDeviceError: If the transport write fails, or if neither
+                a transport nor a cloud client is attached.
+        """
+        from functools import partial
+
+        from pylxpweb.constants import FUNC_EXT_BIT_AC_COUPLING, FUNC_EXT_REGISTER
+
+        client = self._client
+        cloud_write: Callable[[str], Awaitable[SuccessResponse]] | None = None
+        if self._transport is None and client is not None:
+            cloud_write = partial(
+                client.api.control.set_inverter_ac_couple_enabled, enabled=enabled
+            )
+        return await self._set_client_first_function_bit(
+            FUNC_EXT_REGISTER,
+            FUNC_EXT_BIT_AC_COUPLING,
+            enabled,
+            cloud_write,
+        )
 
     # ============================================================================
     # PV Sell to Grid / Export PV Only Operations (GH eg4_web_monitor#135)

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -2352,6 +2352,270 @@ class TestPVSellToGridDualPath:
         assert await inverter.enable_pv_sell_to_grid() is True
 
         mock_client.api.control.enable_pv_sell_to_grid.assert_called_once_with("52842P0581")
+
+
+class TestACCoupleDualPath:
+    """Inverter AC coupling — register 179 bit 11 dual-path control."""
+
+    def _transport_inverter(self, client: LuxpowerClient | None) -> HybridInverter:
+        return HybridInverter(
+            client=client,
+            serial_number="52842P0581",
+            model="FlexBOSS21",
+            transport=Mock(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_transport_status_reads_bit11(self, mock_client: LuxpowerClient) -> None:
+        """Both polarities through the transport's NAMED read (#254)."""
+        inverter = self._transport_inverter(mock_client)
+        transport = inverter._transport
+        assert transport is not None
+
+        transport.read_named_parameters = AsyncMock(
+            return_value={"FUNC_AC_COUPLING_FUNCTION": True}
+        )
+        assert await inverter.get_ac_couple_status() is True
+        transport.read_named_parameters.assert_awaited_once_with(179, 1)
+
+        transport.read_named_parameters = AsyncMock(
+            return_value={"FUNC_AC_COUPLING_FUNCTION": False}
+        )
+        assert await inverter.get_ac_couple_status() is False
+
+    @pytest.mark.asyncio
+    async def test_transport_set_uses_lock_held_named_write(
+        self, mock_client: LuxpowerClient
+    ) -> None:
+        """Transport-first, and through the NAMED write.
+
+        The named write is what holds the transport lock across the whole
+        read-modify-write; the raw _set_modbus_register_bit sequence does
+        not, and register 179 has a second local writer (bit 7).
+        """
+        inverter = self._transport_inverter(mock_client)
+        inverter._transport.write_named_parameters = AsyncMock(return_value=True)
+
+        assert await inverter.set_ac_couple(True) is True
+
+        inverter._transport.write_named_parameters.assert_awaited_once_with(
+            {"FUNC_AC_COUPLING_FUNCTION": True}
+        )
+        # HYBRID prefers the transport: the cloud endpoint stays untouched.
+        mock_client.api.control.set_inverter_ac_couple_enabled.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_clientless_transport_write_needs_no_client(self) -> None:
+        """A CLIENTLESS LOCAL inverter writes without touching self._client.
+
+        The pylxpweb#247 failure class: dereferencing ``self._client.api``
+        on a clientless instance is an AttributeError, not a routing choice.
+        """
+        inverter = self._transport_inverter(None)
+        inverter._transport.write_named_parameters = AsyncMock(return_value=True)
+
+        assert await inverter.set_ac_couple(False) is True
+
+        inverter._transport.write_named_parameters.assert_awaited_once_with(
+            {"FUNC_AC_COUPLING_FUNCTION": False}
+        )
+
+    @pytest.mark.asyncio
+    async def test_clientless_transport_read_needs_no_client(self) -> None:
+        """Same for the status read on a clientless instance."""
+        inverter = self._transport_inverter(None)
+        transport = inverter._transport
+        assert transport is not None
+        transport.read_named_parameters = AsyncMock(
+            return_value={"FUNC_AC_COUPLING_FUNCTION": True}
+        )
+
+        assert await inverter.get_ac_couple_status() is True
+
+    @pytest.mark.asyncio
+    async def test_failed_transport_write_raises_device_error(self) -> None:
+        """A rejected local write raises rather than reporting success."""
+        inverter = self._transport_inverter(None)
+        inverter._transport.write_named_parameters = AsyncMock(return_value=False)
+
+        with pytest.raises(LuxpowerDeviceError, match="requires a successful Modbus write"):
+            await inverter.set_ac_couple(True)
+
+    @pytest.mark.asyncio
+    async def test_no_transport_and_no_client_raises_device_error(self) -> None:
+        """Neither route attached is a device error, never an AttributeError."""
+        inverter = HybridInverter(client=None, serial_number="52842P0581", model="FlexBOSS21")
+
+        with pytest.raises(LuxpowerDeviceError, match="requires a transport or a cloud client"):
+            await inverter.set_ac_couple(True)
+
+    @pytest.mark.asyncio
+    async def test_cloud_status_reads_named_parameter(self, mock_client: LuxpowerClient) -> None:
+        inverter = HybridInverter(
+            client=mock_client, serial_number="52842P0581", model="FlexBOSS21"
+        )
+        mock_client.api.control.read_parameters = AsyncMock(
+            return_value=_cloud_read_response(FUNC_AC_COUPLING_FUNCTION=True)
+        )
+
+        assert await inverter.get_ac_couple_status() is True
+
+        mock_client.api.control.read_parameters.assert_awaited_once_with("52842P0581", 179, 1)
+
+    @pytest.mark.asyncio
+    async def test_cloud_set_uses_dedicated_endpoint(self, mock_client: LuxpowerClient) -> None:
+        """No transport attached: fall back to the dedicated cloud endpoint."""
+        inverter = HybridInverter(
+            client=mock_client, serial_number="52842P0581", model="FlexBOSS21"
+        )
+        mock_client.api.control.set_inverter_ac_couple_enabled = AsyncMock(
+            return_value=_cloud_success()
+        )
+
+        assert await inverter.set_ac_couple(False) is True
+
+        mock_client.api.control.set_inverter_ac_couple_enabled.assert_awaited_once_with(
+            "52842P0581", enabled=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_bit11_write_is_atomic_with_concurrent_reg179_update(self) -> None:
+        """Register 179's two local writers must not lose each other's bit.
+
+        Bit 11 (AC couple) and bit 7 (Grid Peak Shaving) are both written
+        locally. With a raw read-modify-write, a write landing between the
+        other writer's read and its write is silently dropped — reproduced
+        as a lost bit 7 (pylxpweb#254). This drives the REAL ModbusTransport
+        so the lock, not a mock, is what serialises the two.
+
+        Mirrors #254's parametrised harness; kept on this branch so bit 11
+        is covered regardless of which PR merges first.
+        """
+        import asyncio
+
+        from pylxpweb.transports.modbus import ModbusTransport
+
+        register_value = 1 << 9  # an unrelated sibling bit already set
+        transport = ModbusTransport(host="192.0.2.1", serial="1234567890")
+        transport._connected = True
+        inverter = HybridInverter(
+            client=None,
+            serial_number="1234567890",
+            model="FlexBOSS21",
+            transport=transport,
+        )
+        first_read_started = asyncio.Event()
+        release_first_read = asyncio.Event()
+        other_write_started = asyncio.Event()
+        first_read = True
+
+        async def read_holding(address: int, count: int) -> list[int]:
+            nonlocal first_read
+            assert (address, count) == (179, 1)
+            snapshot = register_value
+            if first_read:
+                first_read = False
+                first_read_started.set()
+                await release_first_read.wait()
+            return [snapshot]
+
+        async def write_holding(address: int, values: list[int]) -> bool:
+            nonlocal register_value
+            assert address == 179
+            register_value = values[0]
+            return True
+
+        async def concurrent_peak_shaving_write() -> bool:
+            other_write_started.set()
+            return await transport.write_named_parameters({"FUNC_GRID_PEAK_SHAVING": True})
+
+        with (
+            patch.object(transport, "_read_holding_registers", side_effect=read_holding),
+            patch.object(transport, "_write_holding_registers", side_effect=write_holding),
+        ):
+            ac_couple_task = asyncio.create_task(inverter.set_ac_couple(True))
+            await asyncio.wait_for(first_read_started.wait(), timeout=1)
+            peak_shaving_task = asyncio.create_task(concurrent_peak_shaving_write())
+            await asyncio.wait_for(other_write_started.wait(), timeout=1)
+            release_first_read.set()
+            results = await asyncio.wait_for(
+                asyncio.gather(ac_couple_task, peak_shaving_task), timeout=1
+            )
+
+        assert results == [True, True]
+        # All three bits survive: the pre-existing sibling, AC couple (11)
+        # and the racing peak-shaving write (7).
+        assert register_value == (1 << 9) | (1 << 11) | (1 << 7)
+
+    @pytest.mark.asyncio
+    async def test_ac_couple_write_during_refresh_cannot_stamp_a_stale_cache(self) -> None:
+        """The AC-couple write uses the GENERATION-COUNTER invalidation.
+
+        pylxpweb#254's ``_set_client_first_function_bit`` bumps
+        ``_parameters_write_seq`` so a refresh already in flight cannot stamp
+        a pre-write snapshot as fresh. The #472 branch briefly carried its
+        own copy of that helper whose invalidation only cleared the cache
+        timestamp — no counter — because the mainline helper did not exist
+        yet. This pins that the rebase kept the RIGHT copy: a plain
+        timestamp-clearing implementation leaves ``_parameters_cache_time``
+        stamped by the racing refresh and fails here.
+        """
+        import asyncio
+
+        first_range_started = asyncio.Event()
+        release_first_range = asyncio.Event()
+
+        async def read_named_parameters(start: int, count: int) -> dict[str, bool]:
+            if start == 0:
+                first_range_started.set()
+                await release_first_range.wait()
+                return {"FUNC_AC_COUPLING_FUNCTION": False}
+            return {}
+
+        transport = Mock()
+        transport.read_named_parameters = AsyncMock(side_effect=read_named_parameters)
+        transport.write_named_parameters = AsyncMock(return_value=True)
+        inverter = HybridInverter(
+            client=None,
+            serial_number="1234567890",
+            model="FlexBOSS21",
+            transport=transport,
+        )
+        inverter._parameters_cache_time = datetime.now()
+        seq_before = inverter._parameters_write_seq
+
+        refresh_task = asyncio.create_task(inverter._fetch_parameters())
+        await asyncio.wait_for(first_range_started.wait(), timeout=1)
+        assert await inverter.set_ac_couple(True) is True
+        release_first_range.set()
+        await asyncio.wait_for(refresh_task, timeout=1)
+
+        assert inverter._parameters_write_seq > seq_before
+        assert inverter._parameters_cache_time is None
+
+    @pytest.mark.asyncio
+    async def test_generic_inverter_uses_existing_cloud_helpers(
+        self, mock_client: LuxpowerClient
+    ) -> None:
+        from pylxpweb.devices.inverters.generic import GenericInverter
+
+        inverter = GenericInverter(
+            client=mock_client, serial_number="52842P0581", model="FlexBOSS21"
+        )
+        mock_client.api.control.set_inverter_ac_couple_enabled = AsyncMock(
+            return_value=_cloud_success()
+        )
+        mock_client.api.control.get_inverter_ac_couple_status = AsyncMock(return_value=True)
+
+        assert await inverter.set_ac_couple(True) is True
+        assert await inverter.get_ac_couple_status() is True
+
+        mock_client.api.control.set_inverter_ac_couple_enabled.assert_awaited_once_with(
+            "52842P0581", enabled=True
+        )
+        # The single-register function getter, NOT the three-range SOC-window
+        # read: one bool must not cost three HTTP range reads.
+        mock_client.api.control.get_inverter_ac_couple_status.assert_awaited_once_with("52842P0581")
 
 
 class TestStopDischargeVoltageOperations:
