@@ -23,6 +23,11 @@ Temperature limitations (master RS485):
   - No min temperature register exists. Probed regs 0-255; confirmed no hidden data.
   - Per-cell NTC readings are only available via CAN bus (cloud API).
   - min_cell_temperature and max_cell_temperature are both set to reg 24 value.
+
+Master pack voltage is derived only from a complete, usable cell-voltage set.
+Register 22 is a bank minimum, so it is never exposed as the master's own
+voltage; when the cells are unavailable, voltage is the explicit 0.0 absent
+sentinel instead.
 """
 
 from __future__ import annotations
@@ -42,7 +47,12 @@ _RUNTIME_REGISTERS = (
     BatteryRegister(19, "status", ScaleFactor.SCALE_NONE),
     BatteryRegister(20, "protection", ScaleFactor.SCALE_NONE),
     BatteryRegister(21, "soc", ScaleFactor.SCALE_NONE, unit="%"),
-    BatteryRegister(22, "voltage", ScaleFactor.SCALE_100, unit="V"),
+    # Named for what it is, not for the field it used to populate. Keeping this
+    # metadata distinct makes _reg("voltage") fail instead of relabeling an
+    # aggregate as master data, and supplies the scale for the physical
+    # cross-check below (#249). Register-block start/count, not this metadata,
+    # determines what the transport reads.
+    BatteryRegister(22, "bank_min_voltage", ScaleFactor.SCALE_100, unit="V"),
     BatteryRegister(23, "current", ScaleFactor.SCALE_100, signed=True, unit="A"),
     BatteryRegister(24, "temperature", ScaleFactor.SCALE_NONE, signed=True, unit="\u00b0C"),
     BatteryRegister(28, "firmware_version", ScaleFactor.SCALE_NONE),
@@ -61,6 +71,71 @@ _RUNTIME_REGISTERS = (
 
 _RUNTIME_BLOCK = BatteryRegisterBlock(start=19, count=23, registers=_RUNTIME_REGISTERS)
 _CELL_BLOCK = BatteryRegisterBlock(start=113, count=16, registers=())
+
+# Sanity bounds against corrupt registers, not LiFePO4 specification limits.
+_MIN_PLAUSIBLE_CELL_V = 1.0
+_MAX_PLAUSIBLE_CELL_V = 5.0
+# Stops a transient count such as 1 from turning a truncated prefix of the
+# fixed 16-register cell block into a pack voltage. The only EG4 pack this repo
+# documents is 16S (WP-16/280, see eg4_slave); the floor is set one below that
+# rather than at 16 so a 15S variant we have not seen is not rejected outright.
+# That looseness is deliberate and costs nothing: a 16S pack whose count is
+# corrupted to 15 is caught by the cross-checks below, not by this bound.
+_MIN_PLAUSIBLE_CELL_COUNT = 15
+_MAX_PLAUSIBLE_CELL_COUNT = _CELL_BLOCK.count
+# Reg 22 and the cell block are sampled separately. Half a volt accommodates
+# that skew while still rejecting one-or-more-cell truncation by a wide margin.
+_BANK_MIN_VOLTAGE_TOLERANCE_V = 0.5
+
+
+def _derive_master_voltage(
+    cell_voltages: list[float],
+    cell_count: int,
+    bank_min_voltage: float = 0.0,
+    following_cell_voltage: float = 0.0,
+) -> float:
+    """Derive master pack voltage from a complete, plausible cell set.
+
+    Register 22 is the minimum pack voltage across the bank, not the master's
+    own pack voltage. A missing, partial, zeroed, or corrupt cell set therefore
+    returns the schema's explicit absent sentinel rather than that aggregate.
+    A genuinely collapsed cell below 1.0 V also makes the whole pack voltage
+    absent by design: cell-level canaries retain the fault signal, while a pack
+    sum containing that cell would turn a serious fault into a plausible but
+    misleading low voltage.
+
+    Args:
+        cell_voltages: Decoded individual cell voltages in volts.
+        cell_count: Expected cell count from register 41.
+        bank_min_voltage: Minimum pack voltage across the bank from register 22.
+        following_cell_voltage: Cell-block value immediately after the declared
+            cell count, or zero when the count consumes the full block.
+
+    Returns:
+        Rounded sum of all cells, or 0.0 when the cell set is unusable.
+    """
+    if not _MIN_PLAUSIBLE_CELL_COUNT <= cell_count <= _MAX_PLAUSIBLE_CELL_COUNT:
+        return 0.0
+    # decode_cell_voltages currently returns exactly cell_count entries. Keep
+    # this length check as defence in depth for alternate decoders/callers; the
+    # real register protections are the bounds and cross-checks below.
+    if len(cell_voltages) != cell_count:
+        return 0.0
+    if not all(_MIN_PLAUSIBLE_CELL_V <= value <= _MAX_PLAUSIBLE_CELL_V for value in cell_voltages):
+        return 0.0
+    # The physical block always has 16 registers. A plausible cell immediately
+    # after the declared count proves reg 41 under-reported, even when reg 22 is
+    # absent and cannot provide the stronger physical cross-check.
+    if _MIN_PLAUSIBLE_CELL_V <= following_cell_voltage <= _MAX_PLAUSIBLE_CELL_V:
+        return 0.0
+
+    derived_voltage = round(sum(cell_voltages), 2)
+    # The master is one of the packs contributing to reg 22's bank minimum, so
+    # its voltage cannot be materially below that minimum. This catches corrupt
+    # but superficially plausible counts such as 15 or 1 (#249).
+    if bank_min_voltage > 0 and derived_voltage + _BANK_MIN_VOLTAGE_TOLERANCE_V < bank_min_voltage:
+        return 0.0
+    return derived_voltage
 
 
 class EG4MasterProtocol(BatteryProtocol):
@@ -142,6 +217,14 @@ class EG4MasterProtocol(BatteryProtocol):
     def decode(self, raw_regs: dict[int, int], battery_index: int = 0) -> BatteryData:
         """Decode master battery registers into BatteryData.
 
+        Register 22 is never used as the master's own voltage because it is
+        the minimum across the whole bank. It can look correct in a genuine
+        single-battery bank, but the protocol cannot distinguish that case
+        from a multi-battery bank whose slaves failed to read. A plausible
+        aggregate mislabeled as master data is worse than the explicit 0.0
+        absent sentinel, so only a complete plausible cell set is trusted
+        (#249).
+
         Args:
             raw_regs: Dict mapping register address to raw 16-bit value.
             battery_index: 0-based index of the battery in the bank.
@@ -149,12 +232,10 @@ class EG4MasterProtocol(BatteryProtocol):
         Returns:
             BatteryData with all values properly scaled.
         """
-        voltage_reg = self._reg("voltage")
         current_reg = self._reg("current")
         max_cell_reg = self._reg("max_cell_voltage")
         min_cell_reg = self._reg("min_cell_voltage")
 
-        voltage = self.decode_register(voltage_reg, raw_regs.get(voltage_reg.address, 0))
         current = self.decode_register(current_reg, raw_regs.get(current_reg.address, 0))
 
         temperature = float(signed_int16(raw_regs.get(24, 0)))
@@ -176,6 +257,17 @@ class EG4MasterProtocol(BatteryProtocol):
         num_cells = raw_regs.get(41, 0)
         cell_voltages, fallback_min, fallback_max = self.decode_cell_voltages(
             raw_regs, start_address=113, num_cells=num_cells
+        )
+        bank_min_reg = self._reg("bank_min_voltage")
+        bank_min_voltage = self.decode_register(bank_min_reg, raw_regs.get(bank_min_reg.address, 0))
+        following_cell_voltage = 0.0
+        if 0 <= num_cells < _CELL_BLOCK.count:
+            following_cell_voltage = raw_regs.get(_CELL_BLOCK.start + num_cells, 0) / 1000.0
+        voltage = _derive_master_voltage(
+            cell_voltages,
+            num_cells,
+            bank_min_voltage=bank_min_voltage,
+            following_cell_voltage=following_cell_voltage,
         )
 
         # Prefer dedicated max/min cell voltage registers; fall back to computed values
@@ -262,16 +354,9 @@ class EG4MasterProtocol(BatteryProtocol):
         master_soc = round(master_remaining / designed_ah * 100) if designed_ah > 0 else 0
         master_soc = max(0, min(100, master_soc))
 
-        # Compute master voltage from cell voltages (more accurate than reg 22 = MIN all)
-        voltage = data.voltage
-        if data.cell_voltages:
-            cell_sum = sum(data.cell_voltages)
-            if cell_sum > 0:
-                voltage = round(cell_sum, 2)
-
         return BatteryData(
             battery_index=data.battery_index,
-            voltage=voltage,
+            voltage=data.voltage,
             current=data.current,
             soc=master_soc,
             soh=data.soh,

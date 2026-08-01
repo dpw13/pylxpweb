@@ -33,12 +33,125 @@ class TestEG4MasterProtocol:
         assert 19 in starts  # Runtime starts at 19, not 0
         assert 113 in starts  # Cell voltage block
 
-    def test_decode_voltage(self) -> None:
-        """Pack voltage: reg 22 /100."""
+    def test_master_map_has_no_register_named_voltage(self) -> None:
+        """Reg 22 is the bank minimum and must not answer to "voltage".
+
+        The name is the guardrail: a future author reaching for
+        ``_reg("voltage")`` here -- as the slave protocol legitimately does --
+        would silently reintroduce #249 by decoding a bank aggregate as the
+        master's own pack voltage.  Failing the lookup is the point.
+        """
+        with pytest.raises(KeyError, match="voltage"):
+            self.protocol._reg("voltage")
+
+        assert self.protocol._reg("bank_min_voltage").address == 22
+
+    def test_decode_does_not_use_bank_minimum_as_master_voltage(self) -> None:
+        """Bank-minimum reg 22 is never relabeled as the master's voltage."""
         raw = self._base_regs()
         raw[22] = 5294
         data = self.protocol.decode(raw)
-        assert data.voltage == pytest.approx(52.94)
+        assert data.voltage == 0.0
+
+    def test_decode_voltage_from_complete_cell_block(self) -> None:
+        """A complete plausible cell block supplies the master's pack voltage."""
+        raw = self._base_regs()
+        raw[22] = 5200
+        raw[41] = 16
+        for i in range(16):
+            raw[113 + i] = 3310
+
+        data = self.protocol.decode(raw)
+        assert data.voltage == pytest.approx(52.96)
+
+    def test_decode_voltage_rejects_all_zero_cell_block(self) -> None:
+        """A dropped all-zero cell block yields the absent sentinel, not reg 22."""
+        raw = self._base_regs()
+        raw[22] = 5294
+        raw[41] = 16
+
+        data = self.protocol.decode(raw)
+        assert data.voltage == 0.0
+
+    def test_decode_voltage_rejects_implausibly_low_cell(self) -> None:
+        """A cell below the 1.0 V plausibility bound invalidates the pack sum."""
+        raw = self._base_regs()
+        raw[22] = 5294
+        raw[41] = 16
+        for i in range(16):
+            raw[113 + i] = 3310
+        raw[120] = 999
+
+        data = self.protocol.decode(raw)
+        assert data.voltage == 0.0
+
+    def test_decode_voltage_rejects_implausibly_high_cell(self) -> None:
+        """A corrupt high cell register cannot create a plausible pack voltage."""
+        raw = self._base_regs()
+        raw[22] = 5294
+        raw[41] = 16
+        for i in range(16):
+            raw[113 + i] = 3310
+        raw[120] = 60000
+
+        data = self.protocol.decode(raw)
+        assert data.voltage == 0.0
+
+    def test_decode_voltage_rejects_zero_cell_count(self) -> None:
+        """Cell count zero makes master voltage explicitly absent."""
+        raw = self._base_regs()
+        raw[22] = 5294
+        for i in range(16):
+            raw[113 + i] = 3310
+
+        data = self.protocol.decode(raw)
+        assert data.voltage == 0.0
+
+    def test_decode_voltage_rejects_sum_below_bank_minimum(self) -> None:
+        """Reg 22 rejects a truncated sum that cannot be any bank member's voltage."""
+        raw = self._base_regs()
+        raw[22] = 5294
+        raw[41] = 15
+        for i in range(15):
+            raw[113 + i] = 3310
+
+        data = self.protocol.decode(raw)
+
+        assert data.voltage == 0.0
+
+    def test_decode_voltage_rejects_implausible_cell_count(self) -> None:
+        """A transient one-cell count cannot turn one healthy cell into a pack."""
+        raw = self._base_regs()
+        raw[41] = 1
+        raw[113] = 3310
+
+        data = self.protocol.decode(raw)
+
+        assert data.voltage == 0.0
+
+    def test_decode_voltage_rejects_underreported_count_without_bank_minimum(self) -> None:
+        """A live register after cell_count catches truncation even when reg 22 is absent."""
+        raw = self._base_regs()
+        raw[22] = 0
+        raw[41] = 15
+        for i in range(16):
+            raw[113 + i] = 3310
+
+        data = self.protocol.decode(raw)
+
+        assert data.voltage == 0.0
+
+    def test_decode_voltage_accepts_consistent_fifteen_cell_pack(self) -> None:
+        """A genuine 15-cell pack with a matching bank minimum remains usable."""
+        raw = self._base_regs()
+        raw[22] = 4960
+        raw[41] = 15
+        for i in range(15):
+            raw[113 + i] = 3310
+
+        data = self.protocol.decode(raw)
+
+        assert data.voltage == pytest.approx(49.65)
 
     def test_decode_aggregate_current(self) -> None:
         """Aggregate current: reg 23 /100, signed."""
@@ -110,11 +223,10 @@ class TestEG4MasterProtocol:
         assert data.firmware_version == "2.17"
 
     def test_regs_0_to_18_ignored(self) -> None:
-        """Regs 0-18 are unused in master protocol."""
+        """Slave voltage reg 0 is ignored and an absent cell set stays absent."""
         raw = self._base_regs()
         raw[0] = 5294  # Would be voltage in slave protocol
         data = self.protocol.decode(raw)
-        # Voltage should come from reg 22, not reg 0
         assert data.voltage == pytest.approx(0.0)
 
     def test_decode_negative_temperature(self) -> None:
@@ -145,7 +257,7 @@ class TestEG4MasterProtocol:
         assert data.battery_index == 0
 
     def test_decode_all_zeros_graceful(self) -> None:
-        """All-zero registers decode without error."""
+        """All-zero registers decode with an explicitly absent master voltage."""
         raw = self._base_regs()
         data = self.protocol.decode(raw)
         assert data.voltage == 0.0
@@ -387,7 +499,7 @@ class TestDecodeWithSlaves:
         assert data.current_capacity is None  # Not computed
 
     def test_uses_cell_voltages_for_voltage(self) -> None:
-        """When cell voltages available, voltage = sum(cells) instead of MIN(all)."""
+        """Slave-context decoding preserves the voltage derived by decode()."""
         raw = self._base_regs()
         raw[22] = 5200  # MIN voltage across all batteries (52.00V)
         raw[26] = 464
@@ -405,6 +517,24 @@ class TestDecodeWithSlaves:
 
         data = self.protocol.decode_with_slaves(raw, slave_data)
         # Should use cell sum (52.96V) not MIN voltage (52.00V)
+        assert data.voltage == pytest.approx(52.96)
+
+    def test_voltage_from_cells_when_capacity_registers_zero(self) -> None:
+        """Capacity early-return cannot skip complete-cell voltage derivation."""
+        raw = self._base_regs()
+        raw[21] = 79
+        raw[22] = 5200
+        raw[26] = 0
+        raw[27] = 0
+        raw[33] = 5600
+        raw[41] = 16
+        for i in range(16):
+            raw[113 + i] = 3310
+
+        data = self.protocol.decode_with_slaves(raw, [])
+
+        assert data.soc == 79
+        assert data.current_capacity is None
         assert data.voltage == pytest.approx(52.96)
 
     def test_preserves_other_fields(self) -> None:
