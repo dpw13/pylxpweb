@@ -9,6 +9,131 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Firmware chains no longer stall on a component that is already at the
+  target version**: `standardUpdate/run` takes no component selector, so the
+  server chooses which component a run installs. On a partially upgraded
+  device it can choose one that is already current — that run downloads and
+  flashes normally but cannot move the version string. The orchestrator
+  treated the first unchanged version as a dead chain and aborted, so the
+  component that actually needed upgrading never ran and every retry
+  reproduced the same loop (a 6000XP stuck at `ccaa-1E1415` with target
+  `ccaa-1E1515`, [eg4_web_monitor#353](https://github.com/joyfulhouse/eg4_web_monitor/issues/353)).
+  `run_firmware_update_to_completion` now tolerates a bounded number of
+  consecutive steps that ran without changing the version
+  (`no_progress_grace`, **default 2**), and only when that step's OWN start was
+  observed installing — evidence attributed to our start POST, not any
+  in-progress row for the serial, since a leftover row from an earlier run
+  reads identically — and did not report FAILED. **Honest residual: this
+  converges only while the server does not select more than
+  `no_progress_grace` already-current components in a row.** The default is 2
+  rather than 1 because a device can have several already-current components
+  and the server picks the order; with 1, a device whose first two selections
+  are already-current fails with the identical symptom one step later. The
+  same number sets the blind-reflash exposure on a genuinely stuck device:
+  `no_progress_grace + 1` accepted writes (3). A step only counts as progress
+  if it reaches a version state not already seen in this run, so a check
+  endpoint flapping between two stale snapshots cannot reset the grace
+  indefinitely. Accepted update steps stay bounded by `max_steps`, and refused
+  starts are separately capped per step so the write endpoint cannot be called
+  without bound inside the busy budget. The `needRunStep2..5` flags are logged
+  (not used as a gate — their firmware semantics remain unverified) so the next
+  field report captures them.
+- **Convergence is corroborated against the device, not inferred from the
+  check endpoint alone**: `checkUpdates` answers an up-to-date device with
+  success:false "already the latest version", which the client synthesizes
+  into a record whose installed version is EMPTY — so neither trusting that
+  answer (a partially upgraded device reads as success) nor rejecting it (a
+  genuinely converged device reads as FAILURE, at the exact moment it
+  succeeded) is correct on its own. The orchestrator now reads the device's
+  actual `fwCode` from the runtime endpoint to decide: on the target →
+  converged; still on the version the run started from → the answer was
+  transient, keep going rather than abandoning the chain; unreadable →
+  reported as indeterminate with a message that says to verify the version on
+  the device, not one that implies failure. Version comparison is
+  case-insensitive, and a device that demonstrably moved is accepted even if
+  it does not string-match the target, because the target can be a
+  reconstruction the server never echoes. That movement test compares the
+  runtime code against a baseline read from the SAME endpoint at the start of
+  the run: comparing it against the check endpoint's version string would be
+  a cross-source comparison, and if the two shapes ever differed by more than
+  case, "not equal" would be permanently true and every sentinel would report
+  converged on its first occurrence. Without a same-source baseline the run
+  reports indeterminate rather than treating inequality as movement.
+- **Mid-chain activity attribution no longer demands a new status row**: the
+  stale-row guard added for the previous release compared each step's status
+  row against a pre-POST snapshot. That is right for the FIRST step, where the
+  threat — a leftover row from an earlier run — actually lives, but on a
+  portal that keeps one row per update session and updates it in place, step 2
+  would find an unchanged in-progress row, be refused the grace, and fail with
+  the original reported symptom. From step 2 onward an in-progress row is this
+  run's own activity and counts; the grace and step budget bound it regardless.
+- **An opening "already up to date" answer in the sentinel shape is confirmed
+  before it is believed**: the pre-flight check returned success on "no update
+  available" with no corroboration, so a partially updated device whose first
+  check blinked was told it needed no update at all. An empty-version answer
+  now gets one confirming re-check after a short delay; both agreeing reports
+  up-to-date, disagreement proceeds into the chain. A concrete version with
+  nothing newer is still trusted on one read. Residual: two consecutive blinks
+  would still slip through — this is a confirmation, not a proof.
+- **A transient failure to read back the device's version no longer reports a
+  successful update as failed**: the corroboration read is retried a bounded
+  number of times before settling on indeterminate, because the most likely
+  moment for it to fail is while the device reboots after its final component
+  — exactly when the update has in fact succeeded. The pre-run baseline read
+  gets the same retry: run start is a transient-failure moment in its own
+  right (a device recovering from an earlier attempt), and a failed baseline
+  disables the movement check for the entire run. `ValidationError` is caught
+  alongside API errors, since `fwCode` is a required field and a device
+  omitting it mid-reboot would otherwise raise straight out of the install
+  action.
+- **Convergence now requires evidence, not just the absence of an update**:
+  "no update available" was treated as success, and an empty installed version
+  in the up-to-date sentinel was backfilled with the target — so a device still
+  sitting on the old firmware could be reported as successfully updated to a
+  version it never reached, silently reintroducing the partial upgrade this
+  release exists to fix. Convergence now requires a concrete installed version
+  equal to the target the run set out to reach (pinned from the first check, so
+  a later answer cannot redefine the goal); anything else is reported as a
+  possible partial upgrade with only what is actually known.
+- **A device that is busy before the update starts now fails fast**: busy
+  tolerance was introduced for inter-component settling of a chain already in
+  flight, but it also applied before the first step, so a device still
+  recovering from an earlier update held the caller for the whole retry budget
+  (~5 minutes of "Installing") before failing. Busy responses — from the
+  eligibility probe or the start call — now return immediately while
+  `steps_run == 0`, with a message saying the device is busy and to retry
+  shortly. The deliberate mid-chain tolerance is unchanged and now runs on its
+  own wider budget (`busy_grace`, default 900s, bounded by `step_timeout`),
+  because a component reboot can outlast the post-start visibility grace and
+  giving up there strands the device mid-chain. Busy classification is now
+  matched against the known busy codes instead of any message containing
+  "updating": a permanent failure like "Failed updating firmware: invalid
+  checksum" was being retried for the whole budget and then reported as "device
+  remained busy", burying the real cause — which mattered more once that budget
+  tripled. Classification is two-stage: failure prose (failed/error/invalid/
+  checksum/corrupt/timeout) is permanent even when the message also says
+  "updating"; otherwise any busy/updating wording counts as busy, so portal
+  phrasings nobody has catalogued (`systemBusy`, "Device is updating, please
+  try again") are still waited out rather than aborting a chain that would
+  have succeeded moments later. Classification runs on the SERVER's message,
+  with the client's wrapper stripped first: `LuxpowerClient` raises
+  "API error (HTTP {status}): {msg}" and "Unexpected error: {msg}", both of
+  which contain the word "error" — so classifying the wrapped string matched
+  the wrapper, ruled every busy response permanent, and left the busy path
+  dead in production while unit tests injecting a bare "deviceBusy" passed. A `notAllowedInParallel` eligibility refusal is
+  surfaced at once instead of polled for the full budget, worded as a likely
+  parallel-group conflict to retry after — our own run can induce it, so it is
+  not claimed to be permanent.
+- **An "already the latest version" refusal mid-chain no longer surfaces as a
+  raw error**: if the check endpoint lags a successful final step past the
+  settle window, the no-progress grace can ask for one step too many. The
+  refusal now triggers a forced re-check, and convergence is reported only if
+  that check agrees no update remains; otherwise the run reports a possible
+  partial upgrade with the real installed version, because the two endpoints
+  can genuinely disagree and a false success would hide exactly the failure
+  this fix is about. Before any step, the same response still propagates — that is a
+  genuine disagreement between the check and run endpoints about a device we
+  have not touched.
 - **`FUNC_TAKE_LOAD_TOGETHER` moved from register 110 bit 5 to bit 10**
   (hardware toggle-verified, [#242](https://github.com/joyfulhouse/pylxpweb/issues/242)).
   EG4's cloud decode names this flag while ant0nkr/lxp_modbus put a
