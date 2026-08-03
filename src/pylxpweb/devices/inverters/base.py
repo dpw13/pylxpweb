@@ -167,8 +167,18 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
         self._energy_cache_ttl = timedelta(minutes=5)  # 5-minute TTL for energy
         self._energy_cache_lock = asyncio.Lock()
 
-        # Battery data cache
+        # Battery data cache.  _battery_cache_time is a SUCCESS signal: it is
+        # stamped only when a battery fetch actually delivered data, so
+        # consumers (eg4_web_monitor's device-removal completeness check) can
+        # treat it as "a battery read has genuinely succeeded".  The transport
+        # leg's read_battery() deliberately returns None on a failed/short BMS
+        # block read (eg4_web_monitor#261) — that must NOT stamp it.
         self._battery_cache_time: datetime | None = None
+        # TTL gate for the transport battery read.  Stamped on every attempt
+        # (success or None) so a bank that legitimately reads None every time
+        # (a no-BMS secondary) keeps its polling cadence instead of being
+        # re-read every cycle.
+        self._battery_read_attempt_time: datetime | None = None
         self._battery_cache_ttl = timedelta(seconds=30)  # 30-second TTL for battery
         self._battery_cache_lock = asyncio.Lock()
         # Dedicated clock for the hybrid supplemental cloud battery refresh
@@ -768,7 +778,9 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
                 self._energy_cache_time, self._energy_cache_ttl, force
             )
             battery_expired = self._is_cache_expired(
-                self._battery_cache_time, self._battery_cache_ttl, force
+                self._battery_read_attempt_time or self._battery_cache_time,
+                self._battery_cache_ttl,
+                force,
             )
 
         # Combined read path: when transport supports read_all_input_data
@@ -1040,7 +1052,8 @@ class BaseInverter(FirmwareUpdateMixin, InverterRuntimePropertiesMixin, BaseDevi
                     # Supplement with cloud metadata (battery type, model)
                     await self._fetch_battery_metadata()
                     self._apply_battery_metadata()
-                self._battery_cache_time = datetime.now()
+                    self._battery_cache_time = datetime.now()
+                self._battery_read_attempt_time = datetime.now()
             except Exception as err:
                 # Keep existing cached data on transport errors.  Debug level:
                 # this fires every poll during a link outage.
