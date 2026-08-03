@@ -80,6 +80,13 @@ MODBUS_WRITE_MULTI = 0x10  # Write multiple holding registers
 DEFAULT_PORT = 8000
 DEFAULT_TIMEOUT = 10.0
 RECV_BUFFER_SIZE = 4096
+_FRAME_HEADER_SIZE = 6
+_FRAME_FIXED_FIELDS_SIZE = 14
+_FRAME_CRC_SIZE = 2
+_MIN_ADVERTISED_FRAME_LENGTH = _FRAME_FIXED_FIELDS_SIZE + _FRAME_CRC_SIZE
+_MAX_PACKET_SIZE = RECV_BUFFER_SIZE
+_MAX_PREFIX_SCAN_BYTES = RECV_BUFFER_SIZE
+_SHUTDOWN_CLOSE_TIMEOUT = 0.25
 
 # Write resilience settings (joyfulhouse/eg4_web_monitor#201)
 # The dongle drops its TCP connection mid-sequence during parameter writes
@@ -143,6 +150,10 @@ def _mismatch_context(expected: str, received: str) -> str:
     share one grep-able shape (joyfulhouse/pylxpweb#213).
     """
     return f"expected [{expected}], received [{received}]"
+
+
+class _DongleFrameError(TransportReadError):
+    """A stream-framing failure that makes the current socket unusable."""
 
 
 class DongleTransport(RegisterDataMixin, BaseTransport):
@@ -232,6 +243,7 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
         self._verify_writes = verify_writes
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
+        self._receive_buffer = bytearray()
         self._lock = asyncio.Lock()
         # Serialises connect() itself: _send_receive reconnects under
         # self._lock, but external callers (e.g. a coordinator write path
@@ -241,6 +253,7 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
         # under _connect_lock ever takes _lock, so no cycle.
         self._connect_lock = asyncio.Lock()
         self._transaction_id = 0
+        self._shutdown_requested = False
 
     @property
     def capabilities(self) -> TransportCapabilities:
@@ -371,7 +384,9 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
         Raises:
             TransportConnectionError: If all connection attempts fail
         """
+        self._raise_if_shutdown()
         async with self._connect_lock:
+            self._raise_if_shutdown()
             if self._connected:
                 return  # another task already (re)connected
 
@@ -383,6 +398,7 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
             await self._close_connection()
 
             for attempt in range(self._connection_retries):
+                self._raise_if_shutdown()
                 try:
                     if attempt > 0:
                         _LOGGER.info(
@@ -394,12 +410,18 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                             retry_delay,
                         )
                         await asyncio.sleep(retry_delay)
+                        # Shutdown may arrive while this task is parked in the
+                        # retry backoff. Never start a new TCP dial afterward.
+                        self._raise_if_shutdown()
                         retry_delay *= 2  # Exponential backoff
 
                     self._reader, self._writer = await asyncio.wait_for(
                         asyncio.open_connection(self._host, self._port),
                         timeout=self._timeout,
                     )
+                    if self._shutdown_requested:
+                        await self._close_connection()
+                        self._raise_if_shutdown()
 
                     # Discard any initial data the dongle sends after
                     # connection (some dongles send unsolicited packets that
@@ -408,6 +430,7 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                     # instead of leaking a connected-looking transport with
                     # a broken socket.
                     await self._discard_initial_data()
+                    self._raise_if_shutdown()
 
                     self._connected = True
                     _LOGGER.info(
@@ -423,6 +446,7 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                 except TimeoutError as err:
                     last_error = err
                     await self._close_connection()
+                    self._raise_if_shutdown()
                     _LOGGER.warning(
                         "Timeout connecting to dongle at %s:%s (attempt %d/%d)",
                         self._host,
@@ -433,6 +457,7 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                 except OSError as err:
                     last_error = err
                     await self._close_connection()
+                    self._raise_if_shutdown()
                     _LOGGER.warning(
                         "Connection failed to %s:%s: %s (attempt %d/%d)",
                         self._host,
@@ -441,6 +466,17 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                         attempt + 1,
                         self._connection_retries,
                     )
+                except BaseException:
+                    # CancelledError (or any unexpected error) raised between
+                    # installing the reader/writer and setting _connected would
+                    # otherwise leave an orphaned open socket occupying the
+                    # dongle's single TCP slot — invisible to later cleanup
+                    # because _connected stays False. Close before propagating;
+                    # shutdown-triggered TransportConnectionError takes the
+                    # same path (an extra close on an already-closed socket is
+                    # a no-op).
+                    await self._close_connection()
+                    raise
 
             # All retries exhausted
             await self._close_connection()
@@ -462,28 +498,49 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
     async def disconnect(self) -> None:
         """Close TCP connection to the dongle.
 
-        Uses timeout on wait_closed() to prevent hanging if the connection
-        is in a bad state. The dongle only supports one connection at a time,
-        so proper cleanup is essential.
+        Serialises with both in-flight transactions and connection lifecycle
+        changes.  If a connect is already establishing a socket, disconnect
+        waits and closes that result; if disconnect starts first, a later
+        connect waits until the old socket is fully closed before dialing.
         """
-        if self._writer:
-            try:
-                self._writer.close()
-                # Use timeout to prevent indefinite hang if connection is stuck
-                await asyncio.wait_for(self._writer.wait_closed(), timeout=5.0)
-            except TimeoutError:
-                _LOGGER.warning(
-                    "Timeout waiting for connection close to %s:%s",
-                    self._host,
-                    self._port,
-                )
-            except Exception:  # noqa: BLE001
-                pass  # Ignore other errors during disconnect
-
-        self._reader = None
-        self._writer = None
-        self._connected = False
+        async with self._lock:
+            await self._teardown_connection()
         _LOGGER.debug("Dongle transport disconnected for %s", self._serial)
+
+    async def async_shutdown(self) -> None:
+        """Terminally close the socket without waiting for a held transaction lock.
+
+        Home Assistant unloads must close the stream before cancelling the task
+        that owns ``_lock``; otherwise a muted dongle can hold shutdown behind
+        the full response timeout.  This method is deliberately terminal.  It
+        marks the transport first, detaches and closes the current writer, and
+        makes an in-flight or later ``connect()`` close its result instead of
+        resurrecting the socket. Retry and I/O boundaries re-check the terminal
+        flag after awaited backoffs, drains, writes, and reads, so shutdown does
+        not permit another dial or sequence retry. Ordinary reusable disconnects
+        retain the fully serialised :meth:`disconnect` contract.
+        """
+        self._shutdown_requested = True
+        self._connected = False
+        self._reader = None
+        self._receive_buffer.clear()
+        writer = self._writer
+        self._writer = None
+        if writer is not None:
+            with contextlib.suppress(Exception):
+                writer.close()
+                await asyncio.wait_for(
+                    writer.wait_closed(),
+                    timeout=min(self._timeout, _SHUTDOWN_CLOSE_TIMEOUT),
+                )
+        _LOGGER.debug("Dongle transport shut down for %s", self._serial)
+
+    def _raise_if_shutdown(self) -> None:
+        """Reject socket creation or use after terminal shutdown."""
+        if self._shutdown_requested:
+            raise TransportConnectionError(
+                f"Dongle transport for {self._serial} has been shut down"
+            )
 
     def _build_packet(
         self,
@@ -575,6 +632,11 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
         stale data from previous requests. This method clears the buffer
         before sending a new request to ensure clean communication.
         """
+        # Any bytes retained after extracting a previous frame are stale at
+        # this request boundary (typically an unsolicited heartbeat or a
+        # coalesced late reply), just like bytes waiting in StreamReader.
+        self._receive_buffer.clear()
+
         if not self._reader:
             return
 
@@ -599,6 +661,103 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                     break
         except Exception as err:
             _LOGGER.debug("Error draining buffer: %s", err)
+
+    async def _receive_frame(self) -> bytes:
+        """Read one complete packet from the TCP byte stream.
+
+        TCP reads do not preserve protocol-message boundaries: the two-byte
+        prefix, six-byte outer header, and body may all arrive separately.
+        Locate the prefix with a bounded junk scan, validate the advertised
+        packet size before reading its body, and retain any over-read bytes
+        for the next request-boundary drain.
+
+        The caller owns the single overall response timeout.  This helper
+        deliberately does not start a new timeout per fragment.
+        """
+        reader = self._reader
+        if reader is None:
+            raise TransportConnectionError("Socket not initialized")
+
+        discarded = 0
+
+        async def read_more(expected_size: int | None = None) -> None:
+            chunk = await reader.read(RECV_BUFFER_SIZE)
+            if chunk:
+                self._receive_buffer.extend(chunk)
+                return
+
+            if not self._receive_buffer and discarded == 0:
+                raise _DongleFrameError(
+                    f"[{self._serial}] Empty response from dongle. This may indicate: "
+                    "(1) Dongle firmware is blocking local Modbus access, "
+                    "(2) Connection was closed by dongle, or "
+                    "(3) Dongle requires more time to respond. "
+                    "Try increasing timeout or check dongle firmware version."
+                )
+
+            expected = f" of {expected_size} advertised bytes" if expected_size is not None else ""
+            raise _DongleFrameError(
+                f"[{self._serial}] Connection closed before complete frame: "
+                f"received {len(self._receive_buffer)} bytes{expected}"
+            )
+
+        # Locate a prefix without allowing a peer to grow the retained junk
+        # indefinitely.  Preserve one trailing 0xA1 because the 0xA1 0x1A
+        # prefix itself may straddle two TCP reads.
+        while True:
+            packet_start = self._receive_buffer.find(PACKET_PREFIX)
+            if packet_start >= 0:
+                if packet_start:
+                    discarded += packet_start
+                    if discarded > _MAX_PREFIX_SCAN_BYTES:
+                        raise _DongleFrameError(
+                            f"[{self._serial}] Packet prefix scan exceeded "
+                            f"{_MAX_PREFIX_SCAN_BYTES} bytes"
+                        )
+                    _LOGGER.debug(
+                        "Found packet start after discarding %d bytes of junk data",
+                        discarded,
+                    )
+                    del self._receive_buffer[:packet_start]
+                break
+
+            preserve = int(
+                bool(self._receive_buffer) and self._receive_buffer[-1] == PACKET_PREFIX[0]
+            )
+            junk_size = len(self._receive_buffer) - preserve
+            if junk_size:
+                discarded += junk_size
+                if discarded > _MAX_PREFIX_SCAN_BYTES:
+                    raise _DongleFrameError(
+                        f"[{self._serial}] Packet prefix scan exceeded "
+                        f"{_MAX_PREFIX_SCAN_BYTES} bytes"
+                    )
+                del self._receive_buffer[:junk_size]
+            await read_more()
+
+        while len(self._receive_buffer) < _FRAME_HEADER_SIZE:
+            await read_more()
+
+        advertised_length = struct.unpack("<H", self._receive_buffer[4:6])[0]
+        if advertised_length < _MIN_ADVERTISED_FRAME_LENGTH:
+            raise _DongleFrameError(
+                f"[{self._serial}] Invalid advertised frame length "
+                f"{advertised_length}; minimum is {_MIN_ADVERTISED_FRAME_LENGTH}"
+            )
+
+        packet_size = _FRAME_HEADER_SIZE + advertised_length
+        if packet_size > _MAX_PACKET_SIZE:
+            raise _DongleFrameError(
+                f"[{self._serial}] Advertised packet size {packet_size} exceeds maximum "
+                f"{_MAX_PACKET_SIZE}"
+            )
+
+        while len(self._receive_buffer) < packet_size:
+            await read_more(packet_size)
+
+        packet = bytes(self._receive_buffer[:packet_size])
+        del self._receive_buffer[:packet_size]
+        return packet
 
     async def _teardown_connection(self) -> None:
         """Tear down the connection, serialised on ``_connect_lock``.
@@ -627,6 +786,7 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
         """
         self._connected = False
         self._reader = None
+        self._receive_buffer.clear()
         writer = self._writer
         self._writer = None
         if writer is not None:
@@ -696,8 +856,11 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
         """
         last_error: TransportReadError | None = None
 
+        self._raise_if_shutdown()
         async with self._lock:
+            self._raise_if_shutdown()
             for attempt in range(max_retries + 1):
+                self._raise_if_shutdown()
                 try:
                     # (Re)connect when there is no live connection: first
                     # use, after _teardown_connection(), or an external
@@ -722,42 +885,24 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
 
                     # Drain any pending data before sending (handles unsolicited packets)
                     await self._drain_buffer()
+                    self._raise_if_shutdown()
 
                     # Send packet
-                    self._writer.write(packet)
-                    await self._writer.drain()
+                    writer = self._writer
+                    if writer is None:
+                        raise TransportConnectionError("Socket not initialized")
+                    writer.write(packet)
+                    await writer.drain()
+                    self._raise_if_shutdown()
 
-                    # Receive response with slightly longer timeout for dongles
+                    # Assemble one complete protocol frame.  The single
+                    # wait_for bounds the entire prefix/header/body sequence;
+                    # fragmented reads do not each restart the timeout.
                     response = await asyncio.wait_for(
-                        self._reader.read(RECV_BUFFER_SIZE),
+                        self._receive_frame(),
                         timeout=self._timeout,
                     )
-
-                    if not response:
-                        # recv returned b'' = EOF: the dongle closed the
-                        # connection (or the transport died locally).  This
-                        # socket can never yield a response again — tear it
-                        # down so the retry below (or the next request)
-                        # reconnects instead of re-reading a dead socket.
-                        await self._teardown_connection()
-                        if attempt < max_retries:
-                            _LOGGER.debug(
-                                "[%s] Empty response from dongle (attempt %d/%d), retrying...",
-                                self._serial,
-                                attempt + 1,
-                                max_retries + 1,
-                            )
-                            # Small delay before retry
-                            await asyncio.sleep(0.5)
-                            continue
-                        # Final attempt failed
-                        raise TransportReadError(
-                            f"[{self._serial}] Empty response from dongle. This may indicate: "
-                            "(1) Dongle firmware is blocking local Modbus access, "
-                            "(2) Connection was closed by dongle, or "
-                            "(3) Dongle requires more time to respond. "
-                            "Try increasing timeout or check dongle firmware version."
-                        )
+                    self._raise_if_shutdown()
 
                     # Parse response with cross-request validation.  The
                     # request's own TCP function (packet byte 7) is the
@@ -772,6 +917,24 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                         expected_tcp_func=packet[7],
                     )
 
+                except _DongleFrameError as err:
+                    # EOF, invalid/oversized advertised lengths, or an
+                    # exhausted prefix scan leaves stream alignment unusable.
+                    # Retry only after a fresh connection.
+                    last_error = err
+                    await self._teardown_connection()
+                    self._raise_if_shutdown()
+                    if attempt < max_retries:
+                        _LOGGER.debug(
+                            "[%s] Frame error (attempt %d/%d): %s, reconnecting...",
+                            self._serial,
+                            attempt + 1,
+                            max_retries + 1,
+                            err,
+                        )
+                        await asyncio.sleep(0.5)
+                        continue
+                    raise
                 except TimeoutError as err:
                     # The connection is suspect after ANY response timeout:
                     # the dongle went mute, or the path dropped silently
@@ -782,6 +945,7 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                     # below — dials a fresh connection instead of polling
                     # the dead flow forever (#226).
                     await self._teardown_connection()
+                    self._raise_if_shutdown()
                     if retry_on_timeout and attempt < max_retries:
                         _LOGGER.warning(
                             "[%s] Timeout on attempt %d/%d, will reconnect and resend",
@@ -802,6 +966,7 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                     # Tear down the broken connection; next iteration
                     # will reconnect via the top-of-loop guard.
                     await self._teardown_connection()
+                    self._raise_if_shutdown()
 
                     if attempt < max_retries:
                         _LOGGER.warning(
@@ -820,6 +985,7 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                     raise TransportReadError(f"[{self._serial}] Socket error: {err}") from err
                 except TransportReadError as err:
                     last_error = err
+                    self._raise_if_shutdown()
                     if attempt < max_retries:
                         _LOGGER.debug(
                             "[%s] Read error (attempt %d/%d): %s, retrying...",
@@ -923,10 +1089,47 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
         # Adjust response to start at the packet
         response = response[packet_start:]
 
-        # Minimum response: prefix(2) + version(2) + length(2) + addr(1) + func(1)
-        # + dongle(10) + data_len(2) + some data
-        if len(response) < 20:
+        if len(response) < _FRAME_HEADER_SIZE:
             raise TransportReadError(f"[{self._serial}] Response too short: {len(response)} bytes")
+
+        advertised_length = struct.unpack("<H", response[4:6])[0]
+        if advertised_length < _MIN_ADVERTISED_FRAME_LENGTH:
+            raise TransportReadError(
+                f"[{self._serial}] Invalid advertised frame length "
+                f"{advertised_length}; minimum is {_MIN_ADVERTISED_FRAME_LENGTH}"
+            )
+
+        packet_size = _FRAME_HEADER_SIZE + advertised_length
+        if packet_size > _MAX_PACKET_SIZE:
+            raise TransportReadError(
+                f"[{self._serial}] Advertised packet size {packet_size} exceeds maximum "
+                f"{_MAX_PACKET_SIZE}"
+            )
+        if packet_size > len(response):
+            raise TransportReadError(
+                f"[{self._serial}] Response truncated: advertised {packet_size} bytes, "
+                f"got {len(response)}"
+            )
+
+        # The outer length covers fixed address/function/serial/data-length
+        # fields plus the inner data and CRC.  Requiring both length fields
+        # to agree prevents accepting a CRC-valid prefix of a malformed frame.
+        data_length = struct.unpack("<H", response[18:20])[0]
+        expected_advertised_length = _FRAME_FIXED_FIELDS_SIZE + data_length
+        if advertised_length != expected_advertised_length:
+            raise TransportReadError(
+                f"[{self._serial}] Frame length mismatch: outer advertises "
+                f"{advertised_length}, inner requires {expected_advertised_length}"
+            )
+        if data_length < _FRAME_CRC_SIZE:
+            raise TransportReadError(
+                f"[{self._serial}] Invalid data length {data_length}; minimum is {_FRAME_CRC_SIZE}"
+            )
+
+        # Ignore bytes following the advertised frame.  Stream reads extract
+        # exactly one packet before this parser, while direct parser callers
+        # may supply a buffer containing trailing data.
+        response = response[:packet_size]
 
         # --- TCP function validation (must precede the data-frame checks) ---
         # The dongle shares the 0xA1 0x1A prefix across ALL its frames — the
@@ -958,9 +1161,6 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                     f"0x{response_tcp_func:02x} ({label}): {context} "
                     "— misrouted/unsolicited frame"
                 )
-
-        # Extract data length (frame_length and tcp_func available at bytes 4-6 and 7 if needed)
-        data_length = struct.unpack("<H", response[18:20])[0]
 
         # Data starts at offset 20
         data_start = 20
@@ -1396,6 +1596,8 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
         there is no inner request-level resend multiplying this.
 
         Raises:
+            TransportConnectionError: If terminal shutdown is requested. This
+                is never retried or recast as a generic write failure.
             TransportWriteError: If the write sequence fails after all
                 attempts.  A ``TransportError`` subclass, so HYBRID-mode
                 consumers can still dispatch their cloud API fallback.
@@ -1406,6 +1608,7 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
             last_error: TransportError | None = None
 
             for attempt in range(1, attempts + 1):
+                self._raise_if_shutdown()
                 try:
                     result = await super().write_named_parameters(parameters)
                 except (
@@ -1414,6 +1617,10 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                     TransportTimeoutError,
                     TransportWriteError,
                 ) as err:
+                    # A terminal close is not a transient link failure. Preserve
+                    # its connection-error contract instead of entering the
+                    # sequence retry/backoff and eventually recasting it.
+                    self._raise_if_shutdown()
                     last_error = err
                     if attempt < attempts:
                         _LOGGER.warning(
@@ -1425,15 +1632,19 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                             err,
                         )
                         await self._force_reconnect()
+                        self._raise_if_shutdown()
                         await asyncio.sleep(WRITE_RETRY_DELAY * attempt)
+                        self._raise_if_shutdown()
                     continue
 
+                self._raise_if_shutdown()
                 if not self._verify_writes:
                     return result
 
                 try:
                     mismatches = await self._verify_named_parameters(parameters)
                 except TransportError as err:
+                    self._raise_if_shutdown()
                     # The write itself was acknowledged by the inverter; a
                     # failed verification READ must not fail the operation.
                     _LOGGER.debug(
@@ -1444,6 +1655,7 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                     )
                     return result
 
+                self._raise_if_shutdown()
                 if not mismatches:
                     return result
 
