@@ -325,6 +325,99 @@ class TestCombinedTransportRefresh:
         assert inverter._transport_runtime is mock_runtime
 
 
+class TestTransportBatterySuccessStamp:
+    """_battery_cache_time is a success signal, not an attempt log.
+
+    read_battery() deliberately returns None on a failed/short BMS block read
+    (eg4_web_monitor#261).  eg4_web_monitor's device-removal completeness
+    check (its PR #489) reads _battery_cache_time as "a battery fetch has
+    genuinely succeeded" — an attempt-stamped clock would let a cold-restart
+    battery-read outage masquerade as a confirmed empty bank and authorize
+    deleting live battery module devices.  The TTL gate rides the separate
+    attempt stamp so polling cadence is unchanged.
+    """
+
+    def _inverter_with_battery_read(
+        self, mock_client: LuxpowerClient, read_battery: AsyncMock
+    ) -> ConcreteInverter:
+        inverter = ConcreteInverter(
+            client=mock_client, serial_number="1234567890", model="TestModel"
+        )
+        mock_transport = AsyncMock(spec=["read_runtime", "read_energy", "read_battery"])
+        mock_transport.read_runtime = AsyncMock(return_value=None)
+        mock_transport.read_energy = AsyncMock(return_value=None)
+        mock_transport.read_battery = read_battery
+        inverter._transport = mock_transport
+        return inverter
+
+    @pytest.mark.asyncio
+    async def test_none_read_stamps_attempt_but_not_success(
+        self, mock_client: LuxpowerClient
+    ) -> None:
+        """A None battery read must not stamp the success clock."""
+        inverter = self._inverter_with_battery_read(mock_client, AsyncMock(return_value=None))
+
+        await inverter._fetch_battery()
+
+        assert inverter._battery_cache_time is None
+        assert inverter._battery_read_attempt_time is not None
+
+    @pytest.mark.asyncio
+    async def test_none_read_keeps_polling_cadence(self, mock_client: LuxpowerClient) -> None:
+        """A perpetually-None bank (no-BMS secondary) is still TTL-gated."""
+        read_battery = AsyncMock(return_value=None)
+        inverter = self._inverter_with_battery_read(mock_client, read_battery)
+
+        await inverter.refresh(force=True)
+        assert read_battery.await_count == 1
+
+        # Immediately after, the attempt stamp is fresh: an unforced refresh
+        # must not re-read the battery block even though no success was ever
+        # recorded.
+        await inverter.refresh()
+        assert read_battery.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_successful_read_stamps_success(self, mock_client: LuxpowerClient) -> None:
+        """A delivered battery bank stamps the success clock."""
+        from pylxpweb.transports.data import BatteryBankData
+
+        mock_battery = Mock(spec=BatteryBankData)
+        mock_battery.is_corrupt = Mock(return_value=False)
+        mock_battery.battery_count = 2
+        inverter = self._inverter_with_battery_read(
+            mock_client, AsyncMock(return_value=mock_battery)
+        )
+
+        with (
+            patch.object(inverter, "_fetch_battery_metadata", AsyncMock()),
+            patch.object(inverter, "_apply_battery_metadata", Mock()),
+        ):
+            await inverter._fetch_battery()
+
+        assert inverter._transport_battery is mock_battery
+        assert inverter._battery_cache_time is not None
+        assert inverter._battery_read_attempt_time is not None
+
+    @pytest.mark.asyncio
+    async def test_corrupt_read_stamps_neither(self, mock_client: LuxpowerClient) -> None:
+        """A corrupt read keeps both clocks unset so the next cycle retries."""
+        from pylxpweb.transports.data import BatteryBankData
+
+        mock_battery = Mock(spec=BatteryBankData)
+        mock_battery.is_corrupt = Mock(return_value=True)
+        inverter = self._inverter_with_battery_read(
+            mock_client, AsyncMock(return_value=mock_battery)
+        )
+        inverter.validate_data = True
+
+        await inverter._fetch_battery()
+
+        assert inverter._battery_cache_time is None
+        assert inverter._battery_read_attempt_time is None
+        assert inverter._transport_battery is None
+
+
 class TestInverterDeviceInfo:
     """Test inverter device info generation."""
 
