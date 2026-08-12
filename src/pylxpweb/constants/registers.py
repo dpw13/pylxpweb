@@ -924,14 +924,14 @@ REGISTER_TO_PARAM_KEYS: dict[int, list[str]] = {
         "FUNC_179_BIT12",  # Bit 12: unknown
         "FUNC_179_BIT13",  # Bit 13: unknown
         "FUNC_179_BIT14",  # Bit 14: unknown
-        # Bit 15: Grid Always On (eg4_web_monitor #559). App-write-path-proven
-        # via EG4 mobile Local12KSetFragment.getBitByFunction name→bit
-        # resolver (smali); 4-for-4 against confirmed anchors bits 3/7/9/10.
-        # NOT hardware-toggle-proven. A wrong-bit write is ACKed by the
-        # firmware (#476), so readback can never catch a bad pin — it only
-        # confirms the intended bit's round-trip; the version gate and the
-        # per-family register-179 contract test are the mitigations. Cloud
-        # name FUNC_ON_GRID_ALWAYS_ON.
+        # Bit 15: Grid Always On (eg4_web_monitor #559). HARDWARE-PROVEN
+        # 2026-08-12: portal toggle flipped local raw 0x1048 -> 0x9048
+        # (single-bit XOR 0x8000) with clean restore verified via both cloud
+        # and local reads on FlexBOSS21 52842P0581. (Originally
+        # app-write-path-proven via EG4 mobile Local12KSetFragment
+        # getBitByFunction name→bit resolver, 4-for-4 against confirmed
+        # anchors bits 3/7/9/10.) The per-family register-179 contract test
+        # guards the pin. Cloud name FUNC_ON_GRID_ALWAYS_ON.
         "FUNC_ON_GRID_ALWAYS_ON",
     ],
     # System charge limit (verified via live testing 2026-01-27)

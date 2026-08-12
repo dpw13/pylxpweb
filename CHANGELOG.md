@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.39b11] - 2026-08-12
+
+### Added
+
+- **Holding register 179 bit 15 is mapped as `FUNC_ON_GRID_ALWAYS_ON`**
+  ("Grid Always On",
+  [eg4_web_monitor#559](https://github.com/joyfulhouse/eg4_web_monitor/issues/559),
+  PR [#270](https://github.com/joyfulhouse/pylxpweb/pull/270)), together with a
+  per-family register-179 contract test that pins the bit layout so a silent
+  wrong-bit regression fails loudly. The pin was made on the EG4 mobile app's
+  `Local12KSetFragment.getBitByFunction` name→bit resolver (4-for-4 against
+  confirmed anchor bits 3/7/9/10) and is now **hardware-proven**: on
+  2026-08-12 a portal toggle flipped the local raw value `0x1048 → 0x9048` —
+  exactly a single-bit XOR of `0x8000` — with a clean restore verified via
+  both cloud and local reads on a FlexBOSS21 (`52842P0581`). The evidence
+  grade in the register-table comment is upgraded accordingly.
+
 ## [0.9.39b10] - 2026-08-08
 
 ### Changed
