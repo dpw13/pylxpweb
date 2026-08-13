@@ -524,8 +524,8 @@ INVERTER_HOLDING_REGISTERS: tuple[HoldingRegisterDefinition, ...] = (
     # only the CLOUD named-write path divides by 10 to reach engineering units,
     # and that ÷10 is recorded once in constants.registers.CLOUD_WRITE_DIV10_
     # REGISTERS (keyed by address). min_value/max_value are the post-scaling
-    # engineering bounds (0-15000 W here). Do NOT fold the ÷10 into `scale` — it
-    # would wrongly divide local reads too.
+    # engineering bounds (0-10000 W for reg 66; other family members differ).
+    # Do NOT fold the ÷10 into `scale` — it would wrongly divide local reads too.
     HoldingRegisterDefinition(
         address=66,
         canonical_name="ac_charge_power",
@@ -533,9 +533,9 @@ INVERTER_HOLDING_REGISTERS: tuple[HoldingRegisterDefinition, ...] = (
         ha_entity_key="ac_charge_power",
         unit="W",
         min_value=0,
-        max_value=15000,
+        max_value=10000,
         category=HoldingCategory.POWER,
-        description="AC charge power. Raw value in 100W units (0-150 = 0-15kW).",
+        description="AC charge power. Raw value in 100W units (0-100 = 0-10kW).",
     ),
     HoldingRegisterDefinition(
         address=67,
@@ -623,7 +623,8 @@ INVERTER_HOLDING_REGISTERS: tuple[HoldingRegisterDefinition, ...] = (
         category=HoldingCategory.SCHEDULE,
         description=(
             "Forced/PV charge (ChgFirst) power command. Raw value in 100W units "
-            "(0-150 = 0-15kW), same encoding as AC charge power (reg 66)."
+            "(0-150 = 0-15kW); encoding matches AC charge power (reg 66), but "
+            "the valid ranges differ."
         ),
     ),
     HoldingRegisterDefinition(
@@ -1204,7 +1205,7 @@ INVERTER_HOLDING_REGISTERS: tuple[HoldingRegisterDefinition, ...] = (
         canonical_name="ac_charge_start_soc",
         api_param_key="HOLD_AC_CHARGE_START_BATTERY_SOC",  # verified
         unit="%",
-        min_value=0,
+        min_value=1,
         max_value=90,
         category=HoldingCategory.BATTERY,
         description="Battery SOC to start AC charging.",
