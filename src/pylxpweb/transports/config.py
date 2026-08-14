@@ -25,12 +25,14 @@ Example:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from pylxpweb.devices.inverters._features import InverterFamily
+    from pylxpweb.transports.protocol import TerminalInverterTransport
 
 
 class TransportType(StrEnum):
@@ -274,13 +276,18 @@ class TransportConfig:
         return instance
 
 
+type TransportFactory = Callable[[TransportConfig], "TerminalInverterTransport"]
+"""Factory supplying a transport capability for a matched attachment config."""
+
+
 @dataclass
 class AttachResult:
     """Result of attaching local transports to station devices.
 
     This class reports the outcome of Station.attach_local_transports(),
     indicating which transports were successfully connected, which had
-    no matching device, and which failed to connect.
+    no matching device, and which failed during creation, connection,
+    cleanup, or replacement.
 
     Attributes:
         matched: Number of transports successfully attached to devices.
@@ -320,5 +327,6 @@ class AttachResult:
 __all__ = [
     "TransportType",
     "TransportConfig",
+    "TransportFactory",
     "AttachResult",
 ]

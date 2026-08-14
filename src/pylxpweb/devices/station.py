@@ -28,7 +28,8 @@ _LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from pylxpweb import LuxpowerClient
-    from pylxpweb.transports.config import AttachResult, TransportConfig
+    from pylxpweb.transports.config import AttachResult, TransportConfig, TransportFactory
+    from pylxpweb.transports.protocol import InverterTransport
 
     from .battery import Battery
     from .inverters.base import BaseInverter
@@ -1281,9 +1282,14 @@ class Station(BaseDevice):
             >>> station.is_hybrid_mode
             True
         """
-        return any(inverter._transport is not None for inverter in self.all_inverters)
+        return any(inverter.transport is not None for inverter in self.all_inverters)
 
-    async def attach_local_transports(self, configs: list[TransportConfig]) -> AttachResult:
+    async def attach_local_transports(
+        self,
+        configs: list[TransportConfig],
+        *,
+        transport_factory: TransportFactory | None = None,
+    ) -> AttachResult:
         """Attach local transports to HTTP-discovered devices.
 
         This method enables hybrid mode by connecting local transports
@@ -1294,6 +1300,26 @@ class Station(BaseDevice):
         Args:
             configs: List of TransportConfig objects specifying local transports.
                 Each config includes serial, host, port, and transport type.
+            transport_factory: Optional caller-supplied factory invoked only for
+                matched configs. Its returned capability must implement
+                ``TerminalInverterTransport``; it is connected, retained, and
+                terminally closed through the public transport lifecycle.
+                Pylxpweb-created default transports retain legacy ``disconnect()``
+                compatibility.
+
+        Lifecycle:
+            Serial matching precedes factory invocation. For each match, the
+            returned capability is connected only when needed, then retained as
+            ``device.transport``. A connect or replacement failure terminally
+            closes the new capability and is reported in ``AttachResult``;
+            cancellation performs the same cleanup and propagates. Replacement
+            terminally closes the old capability before publishing the new one.
+            Terminal shutdown runs under the matched device's lifecycle lock; an
+            implementation that exceeds its documented finite shutdown bound
+            blocks later lifecycle operations on that device.
+            Inverter cache TTLs keep the existing transport-type defaults; an
+            injected capability without ``transport_type`` keeps current TTLs,
+            which callers may configure with ``inverter.set_cache_ttls()``.
 
         Returns:
             AttachResult with counts of matched, unmatched, and failed attachments.
@@ -1317,8 +1343,6 @@ class Station(BaseDevice):
             ```
         """
         from pylxpweb.transports import (
-            DongleTransport,
-            ModbusTransport,
             create_dongle_transport,
             create_modbus_transport,
         )
@@ -1352,8 +1376,12 @@ class Station(BaseDevice):
 
             # Create and connect transport
             try:
-                transport: ModbusTransport | DongleTransport
-                if config.transport_type == TransportType.MODBUS_TCP:
+                transport: InverterTransport
+                if transport_factory is not None:
+                    injected_transport = transport_factory(config)
+                    await device.attach_local_transport(injected_transport)
+                    transport = injected_transport
+                elif config.transport_type == TransportType.MODBUS_TCP:
                     transport = create_modbus_transport(
                         host=config.host,
                         port=config.port,
@@ -1381,19 +1409,10 @@ class Station(BaseDevice):
                     result.failed_serials.append(serial)
                     continue
 
-                # Connect the transport
-                await transport.connect()
-
-                # Attach to device (inverter or MID device)
-                device._transport = transport
+                if transport_factory is None:
+                    await device._attach_legacy_local_transport(transport)
                 result.matched += 1
                 device_type = "MID device" if isinstance(device, MIDDevice) else "inverter"
-
-                # Adjust cache TTLs for local transport speed
-                from .inverters.base import BaseInverter
-
-                if isinstance(device, BaseInverter):
-                    device.set_transport_cache_ttls()
 
                 _LOGGER.info(
                     "Attached %s transport to %s %s (%s:%d)",
