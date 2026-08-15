@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -52,6 +52,7 @@ from .exceptions import (
     TransportResponseMismatchError,
     TransportTimeoutError,
 )
+from .observation import RegisterObservation, RegisterObserver, RegisterSegment, RegisterSpace
 
 if TYPE_CHECKING:
     from pylxpweb.devices.inverters._features import InverterFamily
@@ -200,6 +201,59 @@ class _CoalescedReadFallback(Exception):
     """Internal: a coalesced block read failed; retry with plain group reads."""
 
 
+def _append_observed_segment(
+    segments: list[RegisterSegment],
+    start: int,
+    values: Sequence[int],
+) -> None:
+    """Merge a terminal segment, making later overlapping reads authoritative."""
+    if not values:
+        return
+
+    new_segment = RegisterSegment(start, tuple(values))
+    if not segments:
+        segments.append(new_segment)
+        return
+
+    last_segment = segments[-1]
+    if start >= last_segment.start_address + len(last_segment.words):
+        segments.append(new_segment)
+        return
+
+    end = start + len(values)
+    retained: list[RegisterSegment] = []
+    for segment in segments:
+        segment_start = segment.start_address
+        segment_end = segment_start + len(segment.words)
+        if segment_end <= start or segment_start >= end:
+            retained.append(segment)
+            continue
+        if segment_start < start:
+            retained.append(RegisterSegment(segment_start, segment.words[: start - segment_start]))
+        if segment_end > end:
+            retained.append(RegisterSegment(end, segment.words[end - segment_start :]))
+
+    retained.append(new_segment)
+    retained.sort(key=lambda segment: segment.start_address)
+    segments[:] = retained
+
+
+def _capture_register_reads(
+    reader: Callable[[int, int], Coroutine[None, None, list[int]]],
+    segments: list[RegisterSegment] | None,
+) -> Callable[[int, int], Coroutine[None, None, list[int]]]:
+    """Wrap a register reader only when observation capture is enabled."""
+    if segments is None:
+        return reader
+
+    async def observed_reader(start: int, count: int) -> list[int]:
+        values = await reader(start, count)
+        _append_observed_segment(segments, start, values)
+        return values
+
+    return observed_reader
+
+
 def coalesce_register_groups(
     groups: Sequence[tuple[str, tuple[int, int]]],
     max_block_size: int,
@@ -254,12 +308,18 @@ if TYPE_CHECKING:
         _pv_string_count: int
         _max_input_block_size: int
         _input_coalescing_latched_off: bool
+        _register_observer: RegisterObserver | None
 
         async def _read_input_registers(self, start: int, count: int) -> list[int]: ...
 
         async def _read_holding_registers(self, start: int, count: int) -> list[int]: ...
 
         async def _write_holding_registers(self, start: int, values: list[int]) -> bool: ...
+
+        async def _notify_register_observer(
+            self,
+            observations: tuple[RegisterObservation, ...],
+        ) -> None: ...
 
 else:
     _DataMixinBase = object
@@ -319,9 +379,26 @@ class RegisterDataMixin(_DataMixinBase):
             return " (shared-battery secondary — reg96=0 expected)"
         return ""
 
+    async def _notify_observed_segments(
+        self,
+        *observed: tuple[RegisterSpace, Sequence[RegisterSegment] | None],
+    ) -> None:
+        """Publish one method-level callback containing each non-empty space."""
+        if self._register_observer is None:
+            return
+        observations = tuple(
+            RegisterObservation(space, tuple(segments)) for space, segments in observed if segments
+        )
+        await self._notify_register_observer(observations)
+
+    def _new_observed_segments(self) -> list[RegisterSegment] | None:
+        """Allocate capture state only when an observer was configured."""
+        return [] if self._register_observer is not None else None
+
     async def _read_individual_battery_registers(
         self,
         battery_count: int,
+        segments: list[RegisterSegment] | None = None,
     ) -> dict[int, int] | None:
         """Read battery slots atomically and accumulate across round-robin cycles.
 
@@ -401,6 +478,8 @@ class RegisterDataMixin(_DataMixinBase):
             )
             return cached
 
+        if segments is not None:
+            _append_observed_segment(segments, BATTERY_BASE_ADDRESS, values)
         raw_registers = self._registers_from_values(BATTERY_BASE_ADDRESS, values)
 
         # --- Serial-keyed round-robin accumulation (#170, #258) ---
@@ -796,7 +875,10 @@ class RegisterDataMixin(_DataMixinBase):
                 reserved_24,
             )
 
-    async def _read_battery_header_registers(self) -> None:
+    async def _read_battery_header_registers(
+        self,
+        segments: list[RegisterSegment] | None = None,
+    ) -> None:
         """Read registers 5000-5001 for round-robin rotation debugging (#165).
 
         These two registers sit before the per-battery blocks at 5002+.
@@ -809,6 +891,8 @@ class RegisterDataMixin(_DataMixinBase):
         """
         try:
             values = await self._read_input_registers(5000, 2)
+            if segments is not None:
+                _append_observed_segment(segments, 5000, values)
             self._battery_header_registers: dict[int, int] = {
                 5000: values[0],
                 5001: values[1],
@@ -1034,6 +1118,7 @@ class RegisterDataMixin(_DataMixinBase):
     async def _read_register_groups(
         self,
         group_names: list[str] | None = None,
+        segments: list[RegisterSegment] | None = None,
     ) -> dict[int, int]:
         """Read multiple register groups sequentially with inter-group delays.
 
@@ -1057,15 +1142,32 @@ class RegisterDataMixin(_DataMixinBase):
         """
         groups = self._resolve_input_groups(group_names)
         try:
-            return await self._read_group_plan(self._plan_input_reads(groups))
+            winning_segments: list[RegisterSegment] | None = [] if segments is not None else None
+            registers = await self._read_group_plan(
+                self._plan_input_reads(groups), winning_segments
+            )
         except _CoalescedReadFallback:
             # A coalesced block fell back — either it latched coalescing off,
             # or it was a misrouted frame that intentionally did not (#320).
             # Re-read with an explicit plain plan so the retry is one
             # read/group regardless of whether the latch fired.
-            return await self._read_group_plan(self._plain_input_plan(groups))
+            winning_segments = [] if segments is not None else None
+            registers = await self._read_group_plan(
+                self._plain_input_plan(groups), winning_segments
+            )
+        if segments is not None and winning_segments is not None:
+            if not segments:
+                segments.extend(winning_segments)
+            else:
+                for segment in winning_segments:
+                    _append_observed_segment(segments, segment.start_address, segment.words)
+        return registers
 
-    async def _read_group_plan(self, plan: list[_ReadBlock]) -> dict[int, int]:
+    async def _read_group_plan(
+        self,
+        plan: list[_ReadBlock],
+        segments: list[RegisterSegment] | None = None,
+    ) -> dict[int, int]:
         """Execute a read plan sequentially with inter-read delays.
 
         The adaptive-delay backoff only applies to transports that track
@@ -1097,6 +1199,8 @@ class RegisterDataMixin(_DataMixinBase):
 
             for offset, value in enumerate(values):
                 registers[block.start + offset] = value
+            if segments is not None:
+                _append_observed_segment(segments, block.start, values)
 
             # Increase delay when retries occurred to give the device breathing room
             if getattr(self, "_last_read_retried", False):
@@ -1111,7 +1215,10 @@ class RegisterDataMixin(_DataMixinBase):
 
         return registers
 
-    async def _read_pv4_6_registers(self) -> dict[int, int]:
+    async def _read_pv4_6_registers(
+        self,
+        segments: list[RegisterSegment] | None = None,
+    ) -> dict[int, int]:
         """Read the V23-extended PV4-6 input registers if applicable.
 
         Covers both the voltage/power group (217-222) and the daily/lifetime
@@ -1146,6 +1253,8 @@ class RegisterDataMixin(_DataMixinBase):
                 )
                 continue
             registers.update(self._registers_from_values(start, values))
+            if segments is not None:
+                _append_observed_segment(segments, start, values)
         return registers
 
     async def read_quick_charge_remaining_seconds(self) -> int | None:
@@ -1172,6 +1281,11 @@ class RegisterDataMixin(_DataMixinBase):
             )
             return None
         seconds = int(values[0]) if values else 0
+        segments = self._new_observed_segments()
+        if segments is not None:
+            _append_observed_segment(segments, 210, values)
+        if segments:
+            await self._notify_observed_segments((RegisterSpace.INPUT, segments))
         return seconds if seconds > 0 else None
 
     # ------------------------------------------------------------------
@@ -1187,15 +1301,19 @@ class RegisterDataMixin(_DataMixinBase):
         Raises:
             TransportReadError: If read operation fails.
         """
-        input_registers = await self._read_register_groups()
-        input_registers.update(await self._read_pv4_6_registers())
+        segments = self._new_observed_segments()
+        input_registers = await self._read_register_groups(segments=segments)
+        input_registers.update(await self._read_pv4_6_registers(segments))
         family = self._inverter_family.value if self._inverter_family else "EG4_HYBRID"
-        return InverterRuntimeData.from_modbus_registers(
+        result = InverterRuntimeData.from_modbus_registers(
             input_registers,
             family,
             split_phase=self._split_phase,
             pv_string_count=self._pv_string_count,
         )
+        if segments:
+            await self._notify_observed_segments((RegisterSpace.INPUT, segments))
+        return result
 
     async def read_energy(self) -> InverterEnergyData:
         """Read energy statistics via input registers.
@@ -1206,14 +1324,15 @@ class RegisterDataMixin(_DataMixinBase):
         Raises:
             TransportReadError: If read operation fails.
         """
+        segments = self._new_observed_segments()
         input_registers = await self._read_register_groups(
-            ["power_energy", "status_energy", "output_power"]
+            ["power_energy", "status_energy", "output_power"], segments
         )
 
         # bms_data is supplementary — don't fail the entire energy read
         # if these registers time out
         try:
-            bms_registers = await self._read_register_groups(["bms_data"])
+            bms_registers = await self._read_register_groups(["bms_data"], segments)
             input_registers.update(bms_registers)
         except (TransportReadError, TransportTimeoutError):
             _LOGGER.debug(
@@ -1223,14 +1342,17 @@ class RegisterDataMixin(_DataMixinBase):
 
         # V23-extended PV4-6 energy registers (only read for models with >=4
         # strings); gated identically to the runtime path.
-        input_registers.update(await self._read_pv4_6_registers())
+        input_registers.update(await self._read_pv4_6_registers(segments))
 
         family = self._inverter_family.value if self._inverter_family else "EG4_HYBRID"
-        return InverterEnergyData.from_modbus_registers(
+        result = InverterEnergyData.from_modbus_registers(
             input_registers,
             family,
             pv_string_count=self._pv_string_count,
         )
+        if segments:
+            await self._notify_observed_segments((RegisterSpace.INPUT, segments))
+        return result
 
     async def read_battery(
         self,
@@ -1249,12 +1371,15 @@ class RegisterDataMixin(_DataMixinBase):
             TransportReadError: If read operation fails.
         """
         all_registers: dict[int, int] = {}
+        segments = self._new_observed_segments()
 
         # Read core battery registers (power + BMS).
         # Registers 0-31 contain power/voltage/SOC; 80-112 contain BMS data.
         try:
             power_regs = await self._read_input_registers(0, 32)
             all_registers.update(self._registers_from_values(0, power_regs))
+            if segments is not None:
+                _append_observed_segment(segments, 0, power_regs)
         except Exception as e:
             _LOGGER.warning("Failed to read power registers 0-31: %s", e)
 
@@ -1272,6 +1397,8 @@ class RegisterDataMixin(_DataMixinBase):
                 bms_ok = False
             else:
                 all_registers.update(self._registers_from_values(80, bms_regs))
+                if segments is not None:
+                    _append_observed_segment(segments, 80, bms_regs)
         except Exception as e:
             _LOGGER.warning("Failed to read BMS registers 80-112: %s", e)
             bms_ok = False
@@ -1312,9 +1439,10 @@ class RegisterDataMixin(_DataMixinBase):
         if include_individual and (
             battery_count > 0 or getattr(self, "_battery_accumulator", None)
         ):
-            await self._read_battery_header_registers()
+            await self._read_battery_header_registers(segments)
             individual_registers = await self._read_individual_battery_registers(
                 battery_count,
+                segments,
             )
 
         if individual_registers:
@@ -1337,11 +1465,14 @@ class RegisterDataMixin(_DataMixinBase):
                 battery_count,
             )
 
+        if segments:
+            await self._notify_observed_segments((RegisterSpace.INPUT, segments))
         return result
 
     async def _read_all_input_groups(
         self,
         plan: list[_ReadBlock],
+        segments: list[RegisterSegment] | None = None,
     ) -> tuple[dict[int, int], bool]:
         """Execute the combined-read plan, tracking bms_data availability.
 
@@ -1378,6 +1509,8 @@ class RegisterDataMixin(_DataMixinBase):
                     continue
                 for offset, value in enumerate(values):
                     input_registers[block.start + offset] = value
+                if segments is not None:
+                    _append_observed_segment(segments, block.start, values)
             except _CoalescedReadFallback:
                 raise
             except Exception:
@@ -1409,9 +1542,10 @@ class RegisterDataMixin(_DataMixinBase):
             Tuple of (runtime_data, energy_data, battery_data_or_none).
         """
         groups = self._resolve_input_groups(None)
+        winning_segments = self._new_observed_segments()
         try:
             input_registers, bms_ok = await self._read_all_input_groups(
-                self._plan_input_reads(groups)
+                self._plan_input_reads(groups), winning_segments
             )
         except _CoalescedReadFallback:
             # A coalesced block fell back — either it latched coalescing off,
@@ -1419,12 +1553,13 @@ class RegisterDataMixin(_DataMixinBase):
             # an explicit plain plan (one read/group) so the retry never
             # coalesces again, restoring the exact per-group (bms non-fatal)
             # semantics regardless of whether the latch fired.
+            winning_segments = self._new_observed_segments()
             input_registers, bms_ok = await self._read_all_input_groups(
-                self._plain_input_plan(groups)
+                self._plain_input_plan(groups), winning_segments
             )
 
         # V23-extended PV4-6 registers (only read for models with >=4 strings)
-        input_registers.update(await self._read_pv4_6_registers())
+        input_registers.update(await self._read_pv4_6_registers(winning_segments))
 
         family = self._inverter_family.value if self._inverter_family else "EG4_HYBRID"
 
@@ -1440,7 +1575,6 @@ class RegisterDataMixin(_DataMixinBase):
             family,
             pv_string_count=self._pv_string_count,
         )
-
         # The battery bank lives entirely in the bms_data group (reg 96 +
         # voltage/SOC/current/cell/BMS-limit fields).  If that group's read
         # dropped — common on a flaky dongle link, where single requests time
@@ -1453,6 +1587,8 @@ class RegisterDataMixin(_DataMixinBase):
         # runtime + energy still update.  A SUCCESSFUL bms_data read with a
         # genuine reg 96 = 0 is unaffected and still builds a bank.
         if not bms_ok:
+            if winning_segments:
+                await self._notify_observed_segments((RegisterSpace.INPUT, winning_segments))
             return runtime, energy, None
 
         # Read individual battery registers (5000+) if present
@@ -1475,9 +1611,10 @@ class RegisterDataMixin(_DataMixinBase):
         # accumulated, read the block regardless of reg 96; a unit that never
         # accumulated anything (genuinely battery-less) still skips the read.
         if battery_count > 0 or getattr(self, "_battery_accumulator", None):
-            await self._read_battery_header_registers()
+            await self._read_battery_header_registers(winning_segments)
             individual_registers = await self._read_individual_battery_registers(
                 battery_count,
+                winning_segments,
             )
 
         if individual_registers:
@@ -1489,6 +1626,8 @@ class RegisterDataMixin(_DataMixinBase):
         )
         self._stamp_battery_last_seen(battery)
 
+        if winning_segments:
+            await self._notify_observed_segments((RegisterSpace.INPUT, winning_segments))
         return runtime, energy, battery
 
     async def read_midbox_runtime(self) -> MidboxRuntimeData:
@@ -1501,11 +1640,14 @@ class RegisterDataMixin(_DataMixinBase):
             TransportReadError: If read operation fails.
         """
         input_registers: dict[int, int] = {}
+        input_segments = self._new_observed_segments()
 
         try:
             for i, (start, count) in enumerate(MIDBOX_REGISTER_GROUPS):
                 values = await self._read_input_registers(start, count)
                 input_registers.update(self._registers_from_values(start, values))
+                if input_segments is not None:
+                    _append_observed_segment(input_segments, start, values)
 
                 if i < len(MIDBOX_REGISTER_GROUPS) - 1:
                     await asyncio.sleep(self._inter_register_delay)
@@ -1525,15 +1667,24 @@ class RegisterDataMixin(_DataMixinBase):
         # WiFi dongles need time between function code changes to avoid corrupt reads.
         await asyncio.sleep(self._inter_register_delay)
         smart_port_mode_reg: int | None = None
+        holding_segments = self._new_observed_segments()
         try:
             holding_vals = await self._read_holding_registers(20, 1)
             smart_port_mode_reg = holding_vals[0]
+            if holding_segments is not None:
+                _append_observed_segment(holding_segments, 20, holding_vals)
         except Exception:
             _LOGGER.debug("Failed to read smart port mode register 20")
 
-        return MidboxRuntimeData.from_modbus_registers(
+        result = MidboxRuntimeData.from_modbus_registers(
             input_registers, smart_port_mode_reg=smart_port_mode_reg
         )
+        if input_segments:
+            await self._notify_observed_segments(
+                (RegisterSpace.INPUT, input_segments),
+                (RegisterSpace.HOLDING, holding_segments),
+            )
+        return result
 
     async def read_parameters(
         self,
@@ -1553,6 +1704,7 @@ class RegisterDataMixin(_DataMixinBase):
             TransportReadError: If read operation fails.
         """
         result: dict[int, int] = {}
+        segments = self._new_observed_segments()
         remaining = count
         current_address = start_address
 
@@ -1560,6 +1712,8 @@ class RegisterDataMixin(_DataMixinBase):
             chunk_size = min(remaining, 40)
             values = await self._read_holding_registers(current_address, chunk_size)
             result.update(self._registers_from_values(current_address, values))
+            if segments is not None:
+                _append_observed_segment(segments, current_address, values)
             current_address += chunk_size
             remaining -= chunk_size
 
@@ -1567,6 +1721,8 @@ class RegisterDataMixin(_DataMixinBase):
         if 110 in result:
             self._last_hold_110 = result[110]
 
+        if segments:
+            await self._notify_observed_segments((RegisterSpace.HOLDING, segments))
         return result
 
     async def write_parameters(
@@ -1623,15 +1779,30 @@ class RegisterDataMixin(_DataMixinBase):
 
     async def read_serial_number(self) -> str:
         """Read inverter serial number from input registers 115-119."""
-        return await read_serial_number_async(self._read_input_registers, self._serial)
+        segments = self._new_observed_segments()
+        reader = _capture_register_reads(self._read_input_registers, segments)
+        result = await read_serial_number_async(reader, self._serial)
+        if segments:
+            await self._notify_observed_segments((RegisterSpace.INPUT, segments))
+        return result
 
     async def read_firmware_version(self) -> str:
         """Read firmware version from holding registers 7-10."""
-        return await read_firmware_version_async(self._read_holding_registers)
+        segments = self._new_observed_segments()
+        reader = _capture_register_reads(self._read_holding_registers, segments)
+        result = await read_firmware_version_async(reader)
+        if segments:
+            await self._notify_observed_segments((RegisterSpace.HOLDING, segments))
+        return result
 
     async def read_device_type(self) -> int:
         """Read device type code from holding register 19."""
-        return await read_device_type_async(self._read_holding_registers)
+        segments = self._new_observed_segments()
+        reader = _capture_register_reads(self._read_holding_registers, segments)
+        result = await read_device_type_async(reader)
+        if segments:
+            await self._notify_observed_segments((RegisterSpace.HOLDING, segments))
+        return result
 
     def is_midbox_device(self, device_type_code: int) -> bool:
         """Check if device type code indicates a MID/GridBOSS device."""
@@ -1639,7 +1810,12 @@ class RegisterDataMixin(_DataMixinBase):
 
     async def read_parallel_config(self) -> int:
         """Read parallel configuration from input register 113."""
-        return await read_parallel_config_async(self._read_input_registers, self._serial)
+        segments = self._new_observed_segments()
+        reader = _capture_register_reads(self._read_input_registers, segments)
+        result = await read_parallel_config_async(reader, self._serial)
+        if segments:
+            await self._notify_observed_segments((RegisterSpace.INPUT, segments))
+        return result
 
     async def validate_serial(self, expected_serial: str) -> bool:
         """Validate that the connected inverter matches the expected serial."""
