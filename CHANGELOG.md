@@ -25,9 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **EG4 slave register documentation and Z02T11 characterization coverage**
   (PR [#283](https://github.com/joyfulhouse/pylxpweb/pull/283)):
-  corrects the documented EG4 slave device-information register observations
-  and adds coverage characterizing the existing Z02T11 decoding. There is no
-  runtime behavior change.
+  corrects EG4 slave device-information register documentation and adds
+  characterization coverage for existing Z02T11 decoding. There is no runtime
+  behavior change.
 
 ## [0.10.0b2] - 2026-08-15
 
