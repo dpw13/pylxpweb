@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0b3] - 2026-08-16
+
+### Added
+
+- **Runtime register-observer replacement and detach control**
+  ([#284](https://github.com/joyfulhouse/pylxpweb/issues/284), PR
+  [#285](https://github.com/joyfulhouse/pylxpweb/pull/285), release issue
+  [#287](https://github.com/joyfulhouse/pylxpweb/issues/287)):
+  the new runtime-checkable `RegisterObserverControl` capability lets callers
+  use `set_register_observer(...)` on concrete local transports to replace or
+  detach their synchronous register observer without reconnecting. Hybrid
+  transports apply the change only to their local transport. Observations
+  still being captured or queued for delivery are not sent to the previous
+  observer after a change. Existing structural transport protocols remain
+  unchanged, and observers remain synchronous callbacks that return `None`.
+
 ## [0.10.0b2] - 2026-08-15
 
 ### Added
@@ -2660,7 +2676,8 @@ ac_power = inverter.ac_charge_power_limit  # Property access (uses 1-hour cache)
 - **v0.1.1** (2025-11-15): Bug fixes and improvements
 - **v0.1.0** (2025-11-14): Initial release with core functionality
 
-[Unreleased]: https://github.com/joyfulhouse/pylxpweb/compare/v0.10.0b2...HEAD
+[Unreleased]: https://github.com/joyfulhouse/pylxpweb/compare/v0.10.0b3...HEAD
+[0.10.0b3]: https://github.com/joyfulhouse/pylxpweb/compare/v0.10.0b2...v0.10.0b3
 [0.10.0b2]: https://github.com/joyfulhouse/pylxpweb/compare/v0.10.0b1...v0.10.0b2
 [0.10.0b1]: https://github.com/joyfulhouse/pylxpweb/compare/v0.9.39b11...v0.10.0b1
 [0.9.32]: https://github.com/joyfulhouse/pylxpweb/compare/v0.9.29...v0.9.32
