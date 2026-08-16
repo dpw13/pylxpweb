@@ -1,121 +1,631 @@
 name: Publish to PyPI
 
-# Triggered when a GitHub Release is published (created manually via gh CLI or UI)
-# Workflow: gh release create v0.6.5 ... → This workflow builds and publishes to PyPI
-
 on:
   release:
     types: [published]
   workflow_dispatch:
     inputs:
-      environment:
-        description: 'Environment to publish to (skip-publish, testpypi, or pypi)'
+      tag:
+        description: Existing v* tag to validate
         required: true
-        type: choice
-        options:
-          - skip-publish
-          - testpypi
-          - pypi
+        type: string
 
-# Only one release at a time
 concurrency:
-  group: release-publish
+  group: release-publish-${{ github.event.release.tag_name || inputs.tag }}
   cancel-in-progress: false
 
 permissions:
   contents: read
-  id-token: write  # Required for OIDC PyPI publishing
 
 jobs:
   build:
-    name: Build Package
+    name: Build and attest release artifact
+    if: github.event_name == 'release' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    env:
+      UV_PYTHON: '3.13'
+    outputs:
+      artifact-name: ${{ steps.resolve-source.outputs.artifact-name }}
+      commit: ${{ steps.resolve-source.outputs.commit }}
+      project-name: ${{ steps.resolve-source.outputs.project-name }}
+      tag: ${{ steps.resolve-source.outputs.tag }}
+      tree: ${{ steps.resolve-source.outputs.tree }}
+      version: ${{ steps.resolve-source.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - id: checkout-source
+        name: Check out the requested tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          ref: ${{ github.event.release.tag_name || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
+      - id: setup-uv
+        name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           enable-cache: true
-          cache-dependency-glob: "uv.lock"
+          cache-dependency-glob: uv.lock
 
-      - name: Set up Python
+      - id: setup-python
+        name: Set up Python
         run: uv python install 3.13
 
-      - name: Install dependencies
+      - id: resolve-source
+        name: Resolve and bind release source identity
+        env:
+          DISPATCH_TAG: ${{ inputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          RELEASE_DRAFT: ${{ github.event.release.draft }}
+          RELEASE_ID: ${{ github.event.release.id }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TARGET: ${{ github.event.release.target_commitish }}
+          RELEASE_URL: ${{ github.event.release.html_url }}
+        run: |
+          set -euo pipefail
+
+          die() {
+            echo "$1" >&2
+            exit 1
+          }
+
+          if [[ "$EVENT_NAME" == "release" ]]; then
+            tag="$RELEASE_TAG"
+            [[ "$RELEASE_DRAFT" == "false" ]] || die "release must be published"
+            [[ "$RELEASE_ID" =~ ^[0-9]+$ ]] || die "release ID is malformed"
+            [[ -n "$RELEASE_URL" ]] || die "release URL is missing"
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            tag="$DISPATCH_TAG"
+          else
+            die "unsupported release workflow event"
+          fi
+
+          [[ "$tag" == v?* ]] || die "release tag must start with v"
+          git show-ref --verify --quiet "refs/tags/$tag" || die "release tag does not exist"
+
+          tag_object=$(git rev-parse "refs/tags/$tag")
+          commit=$(git rev-parse "refs/tags/$tag^{commit}")
+          tree=$(git rev-parse "refs/tags/$tag^{tree}")
+          [[ "$(git rev-parse HEAD)" == "$commit" ]] || die "checked-out commit does not match tag commit"
+          [[ "$(git rev-parse HEAD^{tree})" == "$tree" ]] || die "checked-out tree does not match tag tree"
+          git merge-base --is-ancestor "$commit" refs/remotes/origin/main || \
+            die "release tag is not an ancestor of origin/main"
+
+          project_name=$(python3 -c \
+            'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["name"])')
+          version=$(python3 -c \
+            'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          [[ "$project_name" == "pylxpweb" ]] || die "unexpected project name"
+          [[ "$tag" == "v$version" ]] || die "release tag does not match project version"
+
+          if [[ "$EVENT_NAME" == "release" ]]; then
+            [[ "$EVENT_SHA" == "$commit" ]] || die "release event commit does not match tag commit"
+            if [[ "$RELEASE_TARGET" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              target_commit=$(git rev-parse --verify "$RELEASE_TARGET^{commit}") || \
+                die "invalid or unresolved release target"
+            elif git check-ref-format "refs/remotes/origin/$RELEASE_TARGET" >/dev/null 2>&1; then
+              target_ref="refs/remotes/origin/$RELEASE_TARGET"
+              git show-ref --verify --quiet "$target_ref" || \
+                die "invalid or unresolved release target"
+              target_commit=$(git rev-parse --verify "$target_ref^{commit}") || \
+                die "invalid or unresolved release target"
+            else
+              die "invalid or unresolved release target"
+            fi
+            git merge-base --is-ancestor "$commit" "$target_commit" || \
+              die "release tag is not an ancestor of release target"
+          fi
+
+          artifact_name="pylxpweb-release-$version-${commit:0:12}"
+          {
+            echo "artifact-name=$artifact_name"
+            echo "commit=$commit"
+            echo "project-name=$project_name"
+            echo "tag=$tag"
+            echo "tag-object=$tag_object"
+            echo "tree=$tree"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - id: sync-build-tools
+        name: Install locked build tools
+        env:
+          UV_LOCKED: '1'
         run: uv sync --all-extras
 
-      - name: Build package
-        run: uv build
+      - id: verify-clean-source
+        name: Verify dependency setup preserved bound source
+        run: git diff --exit-code
 
-      - name: Check package
-        run: uv run twine check dist/*
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: python-package-distributions
-          path: dist/
-          retention-days: 7
-
-      - name: Create build summary
+      - id: build-distributions
+        name: Build wheel and source distribution once
         run: |
-          echo "## Package Built" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Built packages:" >> $GITHUB_STEP_SUMMARY
-          ls -lh dist/ >> $GITHUB_STEP_SUMMARY
+          uv build --out-dir release-bundle/dist
+          rm -f release-bundle/dist/.gitignore
+
+      - id: check-distributions
+        name: Check built distributions
+        run: uv run twine check release-bundle/dist/*
+
+      - id: validate-distributions
+        name: Validate distribution count and metadata
+        env:
+          EXPECTED_PROJECT_NAME: ${{ steps.resolve-source.outputs.project-name }}
+          EXPECTED_VERSION: ${{ steps.resolve-source.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import email
+          import os
+          import pathlib
+          import tarfile
+          import zipfile
+
+          dist = pathlib.Path("release-bundle/dist")
+          wheels = list(dist.glob("*.whl"))
+          sdists = list(dist.glob("*.tar.gz"))
+          files = [path for path in dist.iterdir() if path.is_file()]
+          assert len(wheels) == 1, wheels
+          assert len(sdists) == 1, sdists
+          assert len(files) == 2, files
+
+          with zipfile.ZipFile(wheels[0]) as archive:
+              members = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
+              assert len(members) == 1, members
+              wheel_metadata = email.message_from_bytes(archive.read(members[0]))
+
+          with tarfile.open(sdists[0], "r:gz") as archive:
+              members = [member for member in archive.getmembers() if member.name.count("/") == 1 and member.name.endswith("/PKG-INFO")]
+              assert len(members) == 1, members
+              extracted = archive.extractfile(members[0])
+              assert extracted is not None
+              sdist_metadata = email.message_from_binary_file(extracted)
+
+          for metadata in (wheel_metadata, sdist_metadata):
+              assert metadata["Name"] == os.environ["EXPECTED_PROJECT_NAME"]
+              assert metadata["Version"] == os.environ["EXPECTED_VERSION"]
+          PY
+
+      - id: write-source-manifest
+        name: Write machine-readable source manifest
+        env:
+          ARTIFACT_NAME: ${{ steps.resolve-source.outputs.artifact-name }}
+          COMMIT: ${{ steps.resolve-source.outputs.commit }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          PROJECT_NAME: ${{ steps.resolve-source.outputs.project-name }}
+          RELEASE_ID: ${{ github.event.release.id }}
+          RELEASE_TARGET: ${{ github.event.release.target_commitish }}
+          RELEASE_URL: ${{ github.event.release.html_url }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ steps.resolve-source.outputs.tag }}
+          TAG_OBJECT: ${{ steps.resolve-source.outputs.tag-object }}
+          TREE: ${{ steps.resolve-source.outputs.tree }}
+          VERSION: ${{ steps.resolve-source.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          keys = (
+              "ARTIFACT_NAME",
+              "COMMIT",
+              "EVENT_NAME",
+              "EVENT_SHA",
+              "PROJECT_NAME",
+              "RELEASE_ID",
+              "RELEASE_TARGET",
+              "RELEASE_URL",
+              "REPOSITORY",
+              "TAG",
+              "TAG_OBJECT",
+              "TREE",
+              "VERSION",
+          )
+          manifest = {key.lower(): os.environ[key] for key in keys}
+          manifest["schema_version"] = 1
+          path = pathlib.Path("release-bundle/release-source.json")
+          path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+          PY
+
+      - id: write-sha256-manifest
+        name: Write per-file SHA256 manifest
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import pathlib
+
+          bundle = pathlib.Path("release-bundle")
+          files = sorted([bundle / "release-source.json", *bundle.joinpath("dist").iterdir()])
+          lines = []
+          for path in files:
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              lines.append(f"{digest}  {path.relative_to(bundle).as_posix()}")
+          bundle.joinpath("SHA256SUMS").write_text("\n".join(lines) + "\n")
+          PY
+
+      - id: validate-release-bundle
+        name: Validate complete release bundle
+        env:
+          EXPECTED_ARTIFACT_NAME: ${{ steps.resolve-source.outputs.artifact-name }}
+          EXPECTED_COMMIT: ${{ steps.resolve-source.outputs.commit }}
+          EXPECTED_PROJECT_NAME: ${{ steps.resolve-source.outputs.project-name }}
+          EXPECTED_TAG: ${{ steps.resolve-source.outputs.tag }}
+          EXPECTED_TREE: ${{ steps.resolve-source.outputs.tree }}
+          EXPECTED_VERSION: ${{ steps.resolve-source.outputs.version }}
+        run: &validate-release-bundle |
+          set -euo pipefail
+          (cd release-bundle && sha256sum --check SHA256SUMS)
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          bundle = pathlib.Path("release-bundle")
+          source = json.loads(bundle.joinpath("release-source.json").read_text())
+          expected = {
+              "artifact_name": os.environ["EXPECTED_ARTIFACT_NAME"],
+              "commit": os.environ["EXPECTED_COMMIT"],
+              "project_name": os.environ["EXPECTED_PROJECT_NAME"],
+              "tag": os.environ["EXPECTED_TAG"],
+              "tree": os.environ["EXPECTED_TREE"],
+              "version": os.environ["EXPECTED_VERSION"],
+          }
+          assert {key: source[key] for key in expected} == expected, \
+              "release source identity does not match"
+          wheels = list(bundle.glob("dist/*.whl"))
+          sdists = list(bundle.glob("dist/*.tar.gz"))
+          assert len(wheels) == 1, wheels
+          assert len(sdists) == 1, sdists
+          manifest_paths = {
+              line.split("  ", 1)[1]
+              for line in bundle.joinpath("SHA256SUMS").read_text().splitlines()
+          }
+          expected_hashed = {
+              "release-source.json",
+              wheels[0].relative_to(bundle).as_posix(),
+              sdists[0].relative_to(bundle).as_posix(),
+          }
+          assert manifest_paths == expected_hashed
+          all_files = {
+              path.relative_to(bundle).as_posix() for path in bundle.rglob("*") if path.is_file()
+          }
+          assert all_files == expected_hashed | {"SHA256SUMS"}
+          PY
+
+      - id: upload-release-artifact
+        name: Upload immutable release artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.resolve-source.outputs.artifact-name }}
+          path: release-bundle/
+          if-no-files-found: error
+          retention-days: 30
 
   publish-testpypi:
-    name: Publish to TestPyPI
+    name: Publish original artifact to TestPyPI
+    if: github.event_name == 'release'
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: build
-    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment != 'skip-publish')
     environment: testpypi
-    permissions:
+    permissions: &publisher-permissions
+      contents: read
       id-token: write
     steps:
-      - name: Download build artifacts
-        uses: actions/download-artifact@v8
+      - &download-release-artifact
+        id: download-release-artifact
+        name: Download original release artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: python-package-distributions
-          path: dist/
+          name: ${{ needs.build.outputs.artifact-name }}
+          path: release-bundle/
 
-      - name: Publish to TestPyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+      - &revalidate-release-artifact
+        id: revalidate-release-bundle
+        name: Revalidate original release artifact
+        env:
+          EXPECTED_ARTIFACT_NAME: ${{ needs.build.outputs.artifact-name }}
+          EXPECTED_COMMIT: ${{ needs.build.outputs.commit }}
+          EXPECTED_PROJECT_NAME: ${{ needs.build.outputs.project-name }}
+          EXPECTED_TAG: ${{ needs.build.outputs.tag }}
+          EXPECTED_TREE: ${{ needs.build.outputs.tree }}
+          EXPECTED_VERSION: ${{ needs.build.outputs.version }}
+        run: *validate-release-bundle
+
+      - id: publish-testpypi
+        name: Publish to TestPyPI with trusted publishing
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
+          packages-dir: release-bundle/dist/
           repository-url: https://test.pypi.org/legacy/
-          print-hash: true
+          skip-existing: true
+
+  verify-testpypi:
+    name: Verify TestPyPI artifact and isolated install
+    if: github.event_name == 'release'
+    needs: [build, publish-testpypi]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - *download-release-artifact
+
+      - *revalidate-release-artifact
+
+      - id: setup-uv
+        name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+
+      - id: query-testpypi
+        name: Verify TestPyPI JSON and download both distributions
+        env:
+          ALLOWED_DISTRIBUTION_HOST: test-files.pythonhosted.org
+          EXPECTED_PROJECT_NAME: ${{ needs.build.outputs.project-name }}
+          EXPECTED_VERSION: ${{ needs.build.outputs.version }}
+          MAX_ATTEMPTS: '12'
+          TESTPYPI_JSON_BASE_URL: https://test.pypi.org/pypi
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import time
+          import urllib.parse
+          import urllib.request
+
+          bundle = pathlib.Path("release-bundle")
+          hashes = {}
+          for line in bundle.joinpath("SHA256SUMS").read_text().splitlines():
+              digest, path = line.split("  ", 1)
+              manifest_path = pathlib.PurePosixPath(path)
+              if manifest_path.parts[0] == "dist":
+                  hashes[manifest_path.name] = digest
+
+          assert len(hashes) == 2, "release artifact must contain exactly two distributions"
+          assert sum(name.endswith(".whl") for name in hashes) == 1, "release artifact must contain one wheel"
+          assert sum(name.endswith(".tar.gz") for name in hashes) == 1, "release artifact must contain one sdist"
+
+          project = os.environ["EXPECTED_PROJECT_NAME"]
+          version = os.environ["EXPECTED_VERSION"]
+          url = f'{os.environ["TESTPYPI_JSON_BASE_URL"]}/{project}/{version}/json'
+          attempts = int(os.environ["MAX_ATTEMPTS"])
+          request = urllib.request.Request(url, headers={"User-Agent": "pylxpweb-release-verifier"})
+
+          for attempt in range(1, attempts + 1):
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      payload = json.load(response)
+                  assert payload["info"]["name"] == project, "package index project name does not match"
+                  assert payload["info"]["version"] == version, "package index version does not match"
+                  releases = payload["urls"]
+                  filenames = {release["filename"] for release in releases}
+                  assert len(releases) == len(hashes) and filenames == set(hashes), \
+                      "package index file set does not match"
+                  assert all(release["yanked"] is False for release in releases), \
+                      "package index contains yanked file"
+                  assert all(
+                      release["digests"]["sha256"] == hashes[release["filename"]]
+                      for release in releases
+                  ), "package index hash does not match"
+                  for release in releases:
+                      parsed = urllib.parse.urlparse(release["url"])
+                      assert (
+                          parsed.scheme == "https"
+                          and parsed.hostname == os.environ["ALLOWED_DISTRIBUTION_HOST"]
+                      ), "distribution URL is not allowlisted HTTPS"
+                  break
+              except (AssertionError, KeyError, OSError, TypeError, ValueError):
+                  if attempt == attempts:
+                      raise
+                  time.sleep(min(5 * attempt, 30))
+
+          verified = pathlib.Path("verified-distributions")
+          verified.mkdir()
+          wheel_path = None
+          for release in releases:
+              download_request = urllib.request.Request(
+                  release["url"], headers={"User-Agent": "pylxpweb-release-verifier"}
+              )
+              with urllib.request.urlopen(download_request, timeout=60) as response:
+                  final_url = urllib.parse.urlparse(response.geturl())
+                  assert (
+                      final_url.scheme == "https"
+                      and final_url.hostname == os.environ["ALLOWED_DISTRIBUTION_HOST"]
+                  ), "distribution URL is not allowlisted HTTPS"
+                  content = response.read()
+              filename = release["filename"]
+              assert hashlib.sha256(content).hexdigest() == hashes[filename], \
+                  "downloaded distribution hash does not match"
+              path = verified / filename
+              path.write_bytes(content)
+              if filename.endswith(".whl"):
+                  wheel_path = path
+          assert wheel_path is not None, "verified wheel is missing"
+          with pathlib.Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              print(f"wheel-path={wheel_path}", file=output)
+          PY
+
+      - id: create-verification-environment
+        name: Create clean verification environment
+        run: uv venv --python 3.13 .verify-venv
+
+      - id: install-testpypi-wheel
+        name: Install downloaded wheel with dependencies from production PyPI only
+        env:
+          PYPI_INDEX_URL: https://pypi.org/simple
+          WHEEL_PATH: ${{ steps.query-testpypi.outputs.wheel-path }}
+        run: |
+          env \
+            -u PIP_EXTRA_INDEX_URL \
+            -u PIP_INDEX_URL \
+            -u UV_DEFAULT_INDEX \
+            -u UV_EXTRA_INDEX_URL \
+            -u UV_INDEX \
+            -u UV_INDEX_URL \
+            uv --no-config pip install \
+              --python .verify-venv/bin/python \
+              --default-index "$PYPI_INDEX_URL" \
+              --index-strategy first-index \
+              --strict \
+              "$WHEEL_PATH"
+
+      - id: verify-installed-package
+        name: Validate installed metadata and import
+        env:
+          EXPECTED_PROJECT_NAME: ${{ needs.build.outputs.project-name }}
+          EXPECTED_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          cd "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/.verify-venv/bin/python" - <<'PY'
+          import importlib.metadata
+          import os
+          import pathlib
+          import sys
+
+          import pylxpweb
+
+          distribution = importlib.metadata.distribution(os.environ["EXPECTED_PROJECT_NAME"])
+          assert distribution.metadata["Name"] == os.environ["EXPECTED_PROJECT_NAME"]
+          assert distribution.version == os.environ["EXPECTED_VERSION"]
+          assert pylxpweb.__version__ == os.environ["EXPECTED_VERSION"]
+          package_path = pathlib.Path(pylxpweb.__file__).resolve()
+          package_path.relative_to(pathlib.Path(sys.prefix).resolve())
+          PY
 
   publish-pypi:
-    name: Publish to PyPI
+    name: Publish verified original artifact to PyPI
+    if: github.event_name == 'release'
+    needs: [build, verify-testpypi]
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [build, publish-testpypi]
-    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'pypi')
     environment: pypi
-    permissions:
-      id-token: write
+    permissions: *publisher-permissions
     steps:
-      - name: Download build artifacts
-        uses: actions/download-artifact@v8
-        with:
-          name: python-package-distributions
-          path: dist/
+      - *download-release-artifact
 
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          print-hash: true
+      - *revalidate-release-artifact
 
-      - name: Create PyPI summary
-        run: |
-          echo "## Published to PyPI" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Package: pylxpweb" >> $GITHUB_STEP_SUMMARY
-          echo "Install: \`pip install pylxpweb\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "View on PyPI: https://pypi.org/project/pylxpweb/" >> $GITHUB_STEP_SUMMARY
+      - id: prepare-pypi
+        name: Validate existing PyPI files and stage absent distributions
+        env:
+          EXPECTED_PROJECT_NAME: ${{ needs.build.outputs.project-name }}
+          EXPECTED_VERSION: ${{ needs.build.outputs.version }}
+          BACKOFF_SECONDS: '2'
+          MAX_ATTEMPTS: '3'
+          MAX_BACKOFF_SECONDS: '5'
+          MODE: prepare
+          PYPI_JSON_BASE_URL: https://pypi.org/pypi
+          REQUEST_TIMEOUT_SECONDS: '10'
+          UPLOAD_DIR: pypi-upload
+        run: &verify-pypi-state |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import shutil
+          import time
+          import urllib.error
+          import urllib.request
+
+          bundle = pathlib.Path("release-bundle")
+          hashes = {}
+          paths = {}
+          for line in bundle.joinpath("SHA256SUMS").read_text().splitlines():
+              digest, path = line.split("  ", 1)
+              manifest_path = pathlib.PurePosixPath(path)
+              if manifest_path.parts[0] == "dist":
+                  hashes[manifest_path.name] = digest
+                  paths[manifest_path.name] = bundle.joinpath(*manifest_path.parts)
+
+          assert len(hashes) == 2, "release artifact must contain exactly two distributions"
+          assert sum(name.endswith(".whl") for name in hashes) == 1, "release artifact must contain one wheel"
+          assert sum(name.endswith(".tar.gz") for name in hashes) == 1, "release artifact must contain one sdist"
+          for filename, path in paths.items():
+              assert path.is_file(), f"release artifact is missing {filename}"
+              assert hashlib.sha256(path.read_bytes()).hexdigest() == hashes[filename], \
+                  f"release artifact hash does not match for {filename}"
+
+          project = os.environ["EXPECTED_PROJECT_NAME"]
+          version = os.environ["EXPECTED_VERSION"]
+          mode = os.environ["MODE"]
+          assert mode in {"prepare", "verify"}, "invalid PyPI verification mode"
+          attempts = int(os.environ["MAX_ATTEMPTS"])
+          backoff_seconds = int(os.environ["BACKOFF_SECONDS"])
+          max_backoff_seconds = int(os.environ["MAX_BACKOFF_SECONDS"])
+          request_timeout_seconds = int(os.environ["REQUEST_TIMEOUT_SECONDS"])
+          url = f'{os.environ["PYPI_JSON_BASE_URL"]}/{project}/{version}/json'
+          request = urllib.request.Request(url, headers={"User-Agent": "pylxpweb-release-verifier"})
+
+          for attempt in range(1, attempts + 1):
+              try:
+                  try:
+                      with urllib.request.urlopen(
+                          request, timeout=request_timeout_seconds
+                      ) as response:
+                          payload = json.load(response)
+                  except urllib.error.HTTPError as error:
+                      if error.code != 404:
+                          raise
+                      payload = None
+
+                  if payload is None:
+                      releases = []
+                  else:
+                      assert payload["info"]["name"] == project, "PyPI project name does not match"
+                      assert payload["info"]["version"] == version, "PyPI version does not match"
+                      releases = payload["urls"]
+
+                  filenames = [release["filename"] for release in releases]
+                  filename_set = set(filenames)
+                  assert len(filenames) == len(filename_set), "PyPI contains duplicate filenames"
+                  assert filename_set <= set(hashes), "PyPI contains unexpected file"
+                  assert all(release["yanked"] is False for release in releases), \
+                      "PyPI contains yanked file"
+                  assert all(
+                      release["digests"]["sha256"] == hashes[release["filename"]]
+                      for release in releases
+                  ), "PyPI hash does not match"
+                  if mode == "verify":
+                      assert filename_set == set(hashes), "PyPI final file set does not match"
+                  break
+              except (AssertionError, KeyError, OSError, TypeError, ValueError):
+                  if attempt == attempts:
+                      raise
+                  time.sleep(min(backoff_seconds * attempt, max_backoff_seconds))
+
+          if mode == "prepare":
+              upload_dir = pathlib.Path(os.environ["UPLOAD_DIR"])
+              upload_dir.mkdir()
+              absent = set(hashes) - filename_set
+              for filename in sorted(absent):
+                  shutil.copyfile(paths[filename], upload_dir / filename)
+              with pathlib.Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+                  print(f"upload-needed={'true' if absent else 'false'}", file=output)
+          PY
+
+      - id: publish-pypi
+        name: Publish to PyPI with trusted publishing
+        if: success() && steps.prepare-pypi.outputs.upload-needed == 'true'
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: pypi-upload/
+
+      - id: verify-pypi
+        name: Verify final exact PyPI distribution set
+        env:
+          EXPECTED_PROJECT_NAME: ${{ needs.build.outputs.project-name }}
+          EXPECTED_VERSION: ${{ needs.build.outputs.version }}
+          BACKOFF_SECONDS: '5'
+          MAX_ATTEMPTS: '8'
+          MAX_BACKOFF_SECONDS: '20'
+          MODE: verify
+          PYPI_JSON_BASE_URL: https://pypi.org/pypi
+          REQUEST_TIMEOUT_SECONDS: '15'
+          UPLOAD_DIR: pypi-upload
+        run: *verify-pypi-state
