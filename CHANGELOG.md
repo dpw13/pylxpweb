@@ -29,6 +29,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   characterization coverage for existing Z02T11 decoding. There is no runtime
   behavior change.
 
+### Security
+
+- **Tag-bound, build-once release artifact promotion**
+  ([#291](https://github.com/joyfulhouse/pylxpweb/issues/291), PR
+  [#292](https://github.com/joyfulhouse/pylxpweb/pull/292)):
+  the release workflow builds the wheel and sdist once, binds them to the
+  source commit/tree and their SHA-256 digests, and requires TestPyPI file/hash
+  plus install/metadata verification before promoting the same artifacts to
+  PyPI from a published release tag. Default permissions are read-only; OIDC
+  is limited to the TestPyPI and PyPI publisher jobs declared against their
+  respective repository environments.
+
 ## [0.10.0b2] - 2026-08-15
 
 ### Added
