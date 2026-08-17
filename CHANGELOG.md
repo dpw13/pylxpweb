@@ -29,15 +29,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   characterization coverage for existing Z02T11 decoding. There is no runtime
   behavior change.
 
+- **Build backend pinned to `uv_build==0.9.30`**
+  (PR [#297](https://github.com/joyfulhouse/pylxpweb/pull/297)):
+  source builds require that exact PEP 517 backend, matching the release
+  container's bundled uv version so the offline build cannot resolve a
+  different builder. Runtime dependencies and supported Python versions are
+  unchanged.
+
+### Fixed
+
+- **Aging Modbus TCP sessions are proactively recycled**
+  ([#288](https://github.com/joyfulhouse/pylxpweb/issues/288), PR
+  [#290](https://github.com/joyfulhouse/pylxpweb/pull/290), forward-port PR
+  [#295](https://github.com/joyfulhouse/pylxpweb/pull/295)):
+  `ModbusTransport(..., session_max_age=...)` defaults to 3600 seconds with
+  deterministic ±10% per-transport jitter; callers can choose another interval
+  or `None` to disable age recycling. At each outer public operation boundary,
+  the operation lock permits at most one reconnect and keeps a multi-read or
+  read-modify-write operation on one session generation. Reconnects report
+  `age-recycle`, `error-recycle`, or `disconnected-reconnect`; a failed dial
+  imposes a 60-second cooldown. Terminal `async_shutdown()` closes without
+  waiting on the operation lock and rejects later reuse. HYBRID falls back to
+  HTTP after local failure, then retries and resumes local routing after its
+  configured recovery interval.
+
 ### Security
 
 - **Tag-bound, build-once release artifact promotion**
   ([#291](https://github.com/joyfulhouse/pylxpweb/issues/291), PR
   [#292](https://github.com/joyfulhouse/pylxpweb/pull/292)):
   the release workflow builds the wheel and sdist once, binds them to the
-  source commit/tree and their SHA-256 digests, and requires TestPyPI file/hash
-  plus install/metadata verification before promoting the same artifacts to
-  PyPI from a published release tag. Default permissions are read-only;
+  source commit/tree and their SHA-256 digests, and requires TestPyPI
+  project/version identity, exact filenames and index hashes, downloaded-byte
+  rehashing, and a second index snapshot before promoting the same artifacts
+  to PyPI from a published release tag. Default permissions are read-only;
   trusted-publishing OIDC is limited to the TestPyPI and PyPI publisher jobs
   declared against their respective repository environments.
 
