@@ -37,9 +37,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the release workflow builds the wheel and sdist once, binds them to the
   source commit/tree and their SHA-256 digests, and requires TestPyPI file/hash
   plus install/metadata verification before promoting the same artifacts to
-  PyPI from a published release tag. Default permissions are read-only; OIDC
-  is limited to the TestPyPI and PyPI publisher jobs declared against their
-  respective repository environments.
+  PyPI from a published release tag. Default permissions are read-only;
+  trusted-publishing OIDC is limited to the TestPyPI and PyPI publisher jobs
+  declared against their respective repository environments.
+
+- **Reviewed-merge release provenance binding**
+  ([#296](https://github.com/joyfulhouse/pylxpweb/issues/296), PR
+  [#297](https://github.com/joyfulhouse/pylxpweb/pull/297)):
+  releases use the tag-resident workflow at a published tag whose commit is
+  current main's reviewed two-parent merge and whose tree matches the CI-tested
+  PR head. The wheel and sdist are built once in a digest-pinned uv/Python
+  container with a read-only source mount and no network, and separate source
+  and distribution attestations are verified before package-index staging.
 
 ## [0.10.0b2] - 2026-08-15
 
