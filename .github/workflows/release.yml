@@ -56,6 +56,7 @@ jobs:
           EVENT_SHA: ${{ github.sha }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_DRAFT: ${{ github.event.release.draft }}
+          RELEASE_SOLO_MAINTAINER: ${{ vars.RELEASE_SOLO_MAINTAINER }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           REPOSITORY: ${{ github.repository }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
@@ -164,11 +165,18 @@ jobs:
               "repos/$REPOSITORY/collaborators/$reviewer/permission" --jq .permission)
             printf '%s\t%s\n' "$reviewer" "$permission" >> "$api_dir/permissions.tsv"
           done < "$api_dir/reviewers.txt"
-          gh api --paginate --slurp -H "Accept: application/vnd.github+json" \
-            "repos/$REPOSITORY/collaborators" > "$api_dir/collaborators.json"
+          if [[ "${RELEASE_SOLO_MAINTAINER:-}" == "true" ]]; then
+            gh api -H "Accept: application/vnd.github+json" \
+              "repos/$REPOSITORY/collaborators/$author/permission" \
+              > "$api_dir/author-permission.json"
+          else
+            printf 'null' > "$api_dir/author-permission.json"
+          fi
           python3 - "$api_dir/effective-reviews.json" "$api_dir/permissions.tsv" \
-            "$api_dir/collaborators.json" "$head" "$author" <<'PY'
+            "$api_dir/author-permission.json" "${RELEASE_SOLO_MAINTAINER:-}" \
+            "$head" "$author" <<'PY'
           import json
+          import os
           import pathlib
           import sys
 
@@ -177,9 +185,8 @@ jobs:
               line.split("\t", 1)
               for line in pathlib.Path(sys.argv[2]).read_text().splitlines()
           )
-          collaborator_pages = json.loads(pathlib.Path(sys.argv[3]).read_text())
-          collaborators = [entry for page in collaborator_pages for entry in page]
-          head, author = sys.argv[4:]
+          author_probe = json.loads(pathlib.Path(sys.argv[3]).read_text())
+          solo_flag, head, author = sys.argv[4:]
           eligible = {
               login: review
               for login, review in effective.items()
@@ -188,24 +195,37 @@ jobs:
           assert not any(
               review["state"] == "CHANGES_REQUESTED" for review in eligible.values()
           ), "an eligible reviewer still requests changes"
-          eligible_collaborators = {
-              entry["login"]
-              for entry in collaborators
-              if any(entry["permissions"].get(level) for level in ("push", "maintain", "admin"))
-          }
-          assert eligible_collaborators, "no write-or-higher collaborator is visible"
-          if eligible_collaborators - {author}:
+          eligible_non_author = sorted(login for login in eligible if login != author)
+          waive = (
+              solo_flag == "true"
+              and not eligible_non_author
+              and author_probe["permission"] == "admin"
+          )
+          if waive:
+              print(
+                  "solo-maintainer waiver: no eligible non-author reviewer exists; "
+                  "approval binding waived"
+              )
+              with pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as summary:
+                  summary.write(
+                      "## Solo-maintainer waiver audit\n\n"
+                      f"- `RELEASE_SOLO_MAINTAINER` variable: `{solo_flag}`\n"
+                      f"- PR author: `{author}`\n"
+                      "- Author permission probed via "
+                      f"`repos/.../collaborators/{author}/permission`: "
+                      f"`{author_probe['permission']}`\n"
+                      "- Effective reviews examined: "
+                      f"{json.dumps({login: review['state'] for login, review in sorted(effective.items())})}\n"
+                      "- Eligible non-author reviewers found: "
+                      f"{json.dumps(eligible_non_author)}\n"
+                  )
+          else:
               assert any(
                   login != author
                   and review["state"] == "APPROVED"
                   and review["commit_id"] == head
                   for login, review in eligible.items()
               ), "no effective eligible non-self approval covers the exact PR head"
-          else:
-              print(
-                  "solo-maintainer waiver: no eligible non-author reviewer exists; "
-                  "approval binding waived"
-              )
           PY
 
           gh api --paginate --slurp -H "Accept: application/vnd.github+json" \

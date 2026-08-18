@@ -34,13 +34,38 @@ Publishing is a linear seven-job promotion chain:
    pull request. Its first parent is the previous `main`, its second parent is the
    final pull-request head, and the first parent must be an ancestor of that head.
    The PR base is `main`; GitHub's mutable `pull.base.sha` is not used as historical
-   merge evidence. An effective non-self approval covers the exact head whenever
-   the repository has at least one write-or-higher collaborator other than the PR
-   author; when the author is the sole write-or-higher collaborator, the approval
-   binding is waived and an explicit `solo-maintainer waiver` notice is printed
-   into the job log. The waiver decision is derived from the same GitHub
-   collaborator-permission data the review gate already trusts, and any error
-   while listing collaborators fails closed — an error is never a waiver. The
+   merge evidence. An effective non-self approval covers the exact head, unless
+   the solo-maintainer waiver applies. The waiver fires only when **all** of the
+   following hold: the repository Actions **variable** `RELEASE_SOLO_MAINTAINER`
+   equals `true` (unset or any other value renders empty in the step env and the
+   original assertion stands byte-for-byte); the PR author probes as `admin` via
+   `repos/{repo}/collaborators/{author}/permission` (a solo maintainer is
+   necessarily admin — the variable alone can never waive a mere-write author);
+   and no write-or-higher non-author reviewer has an effective `APPROVED` or
+   `CHANGES_REQUESTED` review on the PR (if one does, the original exact-head
+   binding runs unchanged). A waived run prints an explicit
+   `solo-maintainer waiver` notice into the job log and writes an audit record —
+   variable value, author, probed permission, and the review evidence examined —
+   into the job summary. Any error in the corroboration probe fails closed; an
+   error is never a waiver, and the probe response is indexed strictly so schema
+   drift also fails closed.
+
+   Token-scope facts, verified empirically under this job's exact `GITHUB_TOKEN`
+   permission grants (probe runs 32191036659 and 32191166538, 2026-08-18): the
+   collaborators **list** endpoint (`repos/{repo}/collaborators`) returns HTTP
+   200 with an **empty** list under the job token and must never be used as a
+   binding input; the **per-user** permission endpoint
+   (`repos/{repo}/collaborators/{login}/permission`) works and returns the full
+   permission payload. That is why the waiver corroborates through the per-user
+   endpoint and a declared variable rather than collaborator enumeration.
+
+   Residual admin window (stated honestly): this review binding does **not**
+   prevent bypass by an actor with repository administration rights. Such an
+   actor can set `RELEASE_SOLO_MAINTAINER`, and could equally manage
+   collaborators or branch protection. The variable is accepted precisely
+   because it adds no marginal attacker capability beyond what repo admin
+   already concedes, while being explicit, auditable in the job summary, and
+   revocable in one line. The
    head's single `CI Success` check must come from GitHub Actions and resolve to a
    successful pull-request run of this repository's `.github/workflows/ci.yml`.
 2. The same job builds once in the official uv/Python 3.13 image pinned by the
@@ -194,12 +219,13 @@ unfreezing publication and again during release review:
 - `main` is protected: the final release-candidate PR requires review, dismisses
   stale approval, requires `CI Success`, requires the branch to be up to date,
   prevents bypass, and is merged with GitHub's **Create a merge commit** method.
-  On a solo-maintainer repository (the PR author is the only write-or-higher
-  collaborator), required review cannot be satisfied by anyone else; the
-  workflow's approval binding waives itself in that case, and the branch
-  protection review requirement may be relaxed accordingly until a second
-  eligible collaborator exists — at which point the non-self approval binding
-  re-arms automatically.
+  On a solo-maintainer repository, required review cannot be satisfied by anyone
+  else; the maintainer declares that state by setting the repository Actions
+  variable `RELEASE_SOLO_MAINTAINER` to `true` and may relax the branch
+  protection review requirement accordingly. Restoring full team mode is one
+  line — `gh variable delete RELEASE_SOLO_MAINTAINER` (or set it to anything
+  but `true`) — and an effective write-or-higher non-author review on the
+  release PR re-arms the exact-head binding even while the variable is set.
 - A tag ruleset protects `v*` tags from update and deletion except for the narrow,
   audited recovery operation described below.
 - The `pypi` environment requires an independent reviewer (on a solo-maintainer
@@ -220,8 +246,10 @@ or mutate repository, environment, or package-index settings.
 1. Prepare the final version and every release-tree change in one final candidate
    pull request. `project.version` must equal the intended tag without `v`.
 2. Obtain an effective approval and successful required CI on the exact final head.
-   If the head changes, repeat both gates. On a solo-maintainer repository the
-   workflow waives the approval gate (with a logged notice); CI is still required.
+   If the head changes, repeat both gates. On a solo-maintainer repository with
+   `RELEASE_SOLO_MAINTAINER=true` and an admin author, the workflow waives the
+   approval gate (with a logged notice and a job-summary audit record); required
+   CI on the exact head is never waived.
 3. Merge with GitHub **Create a merge commit**. Do not squash or rebase.
 4. Confirm no later commit has reached `main`, then create the protected `v*` tag
    on that GitHub merge commit and publish the GitHub Release for the same tag.

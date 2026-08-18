@@ -337,6 +337,27 @@ raise SystemExit(2)
     gh.chmod(0o755)
 
 
+def _permission_payload(login: str, permission: str) -> dict[str, Any]:
+    """Mirror the real ``collaborators/{login}/permission`` response shape.
+
+    Captured live under the release job's own GITHUB_TOKEN grants (probe runs
+    32191036659 and 32191166538): the legacy ``permission`` field plus a full
+    ``user`` object carrying fine-grained ``permissions`` booleans and
+    duplicated ``role_name`` keys.
+    """
+    grants = ["pull", "triage", "push", "maintain", "admin"]
+    granted = grants[: grants.index("push" if permission == "write" else permission) + 1]
+    return {
+        "permission": permission,
+        "role_name": permission,
+        "user": {
+            "login": login,
+            "permissions": {grant: grant in granted for grant in grants},
+            "role_name": permission,
+        },
+    }
+
+
 def _release_repo(
     tmp_path: Path, *, lightweight: bool = False, stale_candidate: bool = False
 ) -> dict[str, Any]:
@@ -402,29 +423,9 @@ def _release_repo(
                 "user": {"login": "reviewer"},
             }
         ],
-        f"repos/{repository}/collaborators/reviewer/permission": {"permission": "write"},
-        f"repos/{repository}/collaborators": [
-            {
-                "login": "author",
-                "permissions": {
-                    "admin": True,
-                    "maintain": True,
-                    "push": True,
-                    "triage": True,
-                    "pull": True,
-                },
-            },
-            {
-                "login": "reviewer",
-                "permissions": {
-                    "admin": False,
-                    "maintain": False,
-                    "push": True,
-                    "triage": True,
-                    "pull": True,
-                },
-            },
-        ],
+        f"repos/{repository}/collaborators/reviewer/permission": _permission_payload(
+            "reviewer", "write"
+        ),
         f"repos/{repository}/commits/{head}/check-runs": {
             "check_runs": [
                 {
@@ -1283,59 +1284,65 @@ _SOLO_WAIVER_NOTICE = (
 )
 
 
-def test_binding_still_requires_non_self_approval_when_team_exists(tmp_path: Path) -> None:
-    """Another write-or-higher collaborator existing keeps the approval binding armed."""
+_AUTHOR_PERMISSION_KEY = "repos/joyfulhouse/pylxpweb/collaborators/author/permission"
+_REVIEWS_KEY = "repos/joyfulhouse/pylxpweb/pulls/17/reviews"
+
+
+@pytest.mark.parametrize("variable", [None, "false"], ids=["unset", "false"])
+def test_binding_requires_non_self_approval_without_solo_variable(
+    tmp_path: Path, variable: str | None
+) -> None:
+    """Without RELEASE_SOLO_MAINTAINER == 'true' the original binding stands."""
     case = _release_repo(tmp_path)
-    review_key = "repos/joyfulhouse/pylxpweb/pulls/17/reviews"
-    case["fixtures"][review_key][0]["user"]["login"] = "author"
-    case["fixtures"]["repos/joyfulhouse/pylxpweb/collaborators/author/permission"] = {
-        "permission": "admin"
-    }
-    result = _run_binding(case, tmp_path)
+    case["fixtures"][_REVIEWS_KEY] = []
+    case["fixtures"][_AUTHOR_PERMISSION_KEY] = _permission_payload("author", "admin")
+    overrides = {} if variable is None else {"RELEASE_SOLO_MAINTAINER": variable}
+    result = _run_binding(case, tmp_path, **overrides)
     assert result.returncode != 0
     assert "no effective eligible non-self approval" in result.stderr
     assert _SOLO_WAIVER_NOTICE not in result.stdout
 
 
-def test_binding_waives_approval_when_author_is_sole_eligible_collaborator(
-    tmp_path: Path,
-) -> None:
-    """A solo-maintainer repo releases without approval, with an explicit log notice."""
+def test_binding_waives_approval_for_declared_solo_admin_author(tmp_path: Path) -> None:
+    """Variable set, admin author, no eligible reviews: waiver plus audit record."""
     case = _release_repo(tmp_path)
-    case["fixtures"]["repos/joyfulhouse/pylxpweb/pulls/17/reviews"] = []
-    case["fixtures"]["repos/joyfulhouse/pylxpweb/collaborators"] = [
-        {
-            "login": "author",
-            "permissions": {
-                "admin": True,
-                "maintain": True,
-                "push": True,
-                "triage": True,
-                "pull": True,
-            },
-        },
-        {
-            "login": "watcher",
-            "permissions": {
-                "admin": False,
-                "maintain": False,
-                "push": False,
-                "triage": False,
-                "pull": True,
-            },
-        },
-    ]
-    result = _run_binding(case, tmp_path)
+    case["fixtures"][_REVIEWS_KEY] = []
+    case["fixtures"][_AUTHOR_PERMISSION_KEY] = _permission_payload("author", "admin")
+    result = _run_binding(case, tmp_path, RELEASE_SOLO_MAINTAINER="true")
     assert result.returncode == 0, result.stderr
     assert _SOLO_WAIVER_NOTICE in result.stdout
+    summary = (tmp_path / "github-summary").read_text()
+    assert "Solo-maintainer waiver audit" in summary
+    assert "- PR author: `author`" in summary
+    assert "`admin`" in summary
+    assert "Eligible non-author reviewers found: []" in summary
 
 
-def test_binding_fails_closed_when_collaborator_listing_errors(tmp_path: Path) -> None:
-    """An error while listing collaborators must fail the release, never waive it."""
+def test_binding_ignores_solo_variable_for_non_admin_author(tmp_path: Path) -> None:
+    """A write-not-admin author cannot be waived by the variable alone."""
     case = _release_repo(tmp_path)
-    case["fixtures"]["repos/joyfulhouse/pylxpweb/pulls/17/reviews"] = []
-    del case["fixtures"]["repos/joyfulhouse/pylxpweb/collaborators"]
-    result = _run_binding(case, tmp_path)
+    case["fixtures"][_REVIEWS_KEY] = []
+    case["fixtures"][_AUTHOR_PERMISSION_KEY] = _permission_payload("author", "write")
+    result = _run_binding(case, tmp_path, RELEASE_SOLO_MAINTAINER="true")
+    assert result.returncode != 0
+    assert "no effective eligible non-self approval" in result.stderr
+    assert _SOLO_WAIVER_NOTICE not in result.stdout
+
+
+def test_binding_prefers_existing_eligible_review_over_waiver(tmp_path: Path) -> None:
+    """An eligible non-author review re-arms the exact-head binding despite the variable."""
+    case = _release_repo(tmp_path)
+    case["fixtures"][_AUTHOR_PERMISSION_KEY] = _permission_payload("author", "admin")
+    result = _run_binding(case, tmp_path, RELEASE_SOLO_MAINTAINER="true")
+    assert result.returncode == 0, result.stderr
+    assert _SOLO_WAIVER_NOTICE not in result.stdout
+
+
+def test_binding_fails_closed_when_author_permission_probe_errors(tmp_path: Path) -> None:
+    """An error probing the author's permission must fail the release, never waive it."""
+    case = _release_repo(tmp_path)
+    case["fixtures"][_REVIEWS_KEY] = []
+    result = _run_binding(case, tmp_path, RELEASE_SOLO_MAINTAINER="true")
     assert result.returncode != 0
     assert _SOLO_WAIVER_NOTICE not in result.stdout
 
