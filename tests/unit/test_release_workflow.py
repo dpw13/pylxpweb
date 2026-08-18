@@ -337,27 +337,6 @@ raise SystemExit(2)
     gh.chmod(0o755)
 
 
-def _permission_payload(login: str, permission: str) -> dict[str, Any]:
-    """Mirror the real ``collaborators/{login}/permission`` response shape.
-
-    Captured live under the release job's own GITHUB_TOKEN grants (probe runs
-    32191036659 and 32191166538): the legacy ``permission`` field plus a full
-    ``user`` object carrying fine-grained ``permissions`` booleans and
-    duplicated ``role_name`` keys.
-    """
-    grants = ["pull", "triage", "push", "maintain", "admin"]
-    granted = grants[: grants.index("push" if permission == "write" else permission) + 1]
-    return {
-        "permission": permission,
-        "role_name": permission,
-        "user": {
-            "login": login,
-            "permissions": {grant: grant in granted for grant in grants},
-            "role_name": permission,
-        },
-    }
-
-
 def _release_repo(
     tmp_path: Path, *, lightweight: bool = False, stale_candidate: bool = False
 ) -> dict[str, Any]:
@@ -415,17 +394,6 @@ def _release_repo(
                 "user": {"login": "author"},
             }
         ],
-        f"repos/{repository}/pulls/17/reviews": [
-            {
-                "state": "APPROVED",
-                "commit_id": head,
-                "submitted_at": "2026-08-16T11:00:00Z",
-                "user": {"login": "reviewer"},
-            }
-        ],
-        f"repos/{repository}/collaborators/reviewer/permission": _permission_payload(
-            "reviewer", "write"
-        ),
         f"repos/{repository}/commits/{head}/check-runs": {
             "check_runs": [
                 {
@@ -943,9 +911,7 @@ def test_harness_never_hands_bash_a_python_heredoc(
 
 
 @pytest.mark.parametrize("lightweight", [False, True], ids=["annotated", "lightweight"])
-def test_binding_accepts_exact_reviewed_merge_and_peels_tag(
-    tmp_path: Path, lightweight: bool
-) -> None:
+def test_binding_accepts_exact_merged_pr_and_peels_tag(tmp_path: Path, lightweight: bool) -> None:
     """Changing tag peeling or exact merge binding rejects a valid release."""
     case = _release_repo(tmp_path, lightweight=lightweight)
     result = _run_binding(case, tmp_path)
@@ -1159,47 +1125,12 @@ def test_binding_rejects_invalid_merge_and_associated_pr(tmp_path: Path, mutatio
     assert result.returncode != 0
 
 
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        "dismissed",
-        "old-head",
-        "self",
-        "outsider",
-        "eligible-change-request",
-        "failed-ci",
-        "wrong-ci-head",
-    ],
-)
-def test_binding_rejects_ineffective_review_or_required_ci(tmp_path: Path, mutation: str) -> None:
-    """Dropping exact-head approval or CI checks permits stale review state."""
+@pytest.mark.parametrize("mutation", ["failed-ci", "wrong-ci-head"])
+def test_binding_rejects_missing_or_stale_required_ci(tmp_path: Path, mutation: str) -> None:
+    """Dropping the exact-head CI-success binding permits an untested candidate."""
     case = _release_repo(tmp_path)
-    review_key = "repos/joyfulhouse/pylxpweb/pulls/17/reviews"
     check_key = f"repos/joyfulhouse/pylxpweb/commits/{case['head']}/check-runs"
-    if mutation == "dismissed":
-        case["fixtures"][review_key][0]["state"] = "DISMISSED"
-    elif mutation == "old-head":
-        case["fixtures"][review_key][0]["commit_id"] = case["parent"]
-    elif mutation == "self":
-        case["fixtures"][review_key][0]["user"]["login"] = "author"
-    elif mutation == "outsider":
-        case["fixtures"]["repos/joyfulhouse/pylxpweb/collaborators/reviewer/permission"][
-            "permission"
-        ] = "read"
-    elif mutation == "eligible-change-request":
-        case["fixtures"][review_key].append(
-            {
-                "id": 2,
-                "state": "CHANGES_REQUESTED",
-                "commit_id": case["head"],
-                "submitted_at": "2026-08-16T11:30:00Z",
-                "user": {"login": "blocker"},
-            }
-        )
-        case["fixtures"]["repos/joyfulhouse/pylxpweb/collaborators/blocker/permission"] = {
-            "permission": "maintain"
-        }
-    elif mutation == "failed-ci":
+    if mutation == "failed-ci":
         case["fixtures"][check_key]["check_runs"][0]["conclusion"] = "failure"
     elif mutation == "wrong-ci-head":
         case["fixtures"][check_key]["check_runs"][0]["head_sha"] = case["parent"]
@@ -1248,103 +1179,17 @@ def test_binding_rejects_same_name_ci_from_untrusted_producer(
     assert result.returncode != 0
 
 
-def test_binding_reads_all_review_pages_before_deciding(tmp_path: Path) -> None:
-    """Dropping pagination can miss a later blocking review after page one."""
+def test_binding_releases_merged_pr_with_zero_reviews(tmp_path: Path) -> None:
+    """Review approval is not required: a merged two-parent PR releases as-is.
+
+    The fixtures contain no review data at all, so any re-introduction of a
+    review-approval binding (which would have to fetch and assert on reviews)
+    fails this test rather than silently tightening the release contract.
+    """
     case = _release_repo(tmp_path)
-    review_key = "repos/joyfulhouse/pylxpweb/pulls/17/reviews"
-    reviews = case["fixtures"][review_key]
-    reviews.extend(
-        {
-            "id": index,
-            "state": "COMMENTED",
-            "commit_id": case["head"],
-            "submitted_at": f"2026-08-16T11:{index:02d}:00Z",
-            "user": {"login": f"commenter-{index}"},
-        }
-        for index in range(1, 31)
-    )
-    reviews.append(
-        {
-            "id": 31,
-            "state": "CHANGES_REQUESTED",
-            "commit_id": case["head"],
-            "submitted_at": "2026-08-16T12:00:00Z",
-            "user": {"login": "late-blocker"},
-        }
-    )
-    case["fixtures"]["repos/joyfulhouse/pylxpweb/collaborators/late-blocker/permission"] = {
-        "permission": "write"
-    }
+    assert not any("reviews" in endpoint for endpoint in case["fixtures"])
     result = _run_binding(case, tmp_path)
-    assert result.returncode != 0
-
-
-_SOLO_WAIVER_NOTICE = (
-    "solo-maintainer waiver: no eligible non-author reviewer exists; approval binding waived"
-)
-
-
-_AUTHOR_PERMISSION_KEY = "repos/joyfulhouse/pylxpweb/collaborators/author/permission"
-_REVIEWS_KEY = "repos/joyfulhouse/pylxpweb/pulls/17/reviews"
-
-
-@pytest.mark.parametrize("variable", [None, "false"], ids=["unset", "false"])
-def test_binding_requires_non_self_approval_without_solo_variable(
-    tmp_path: Path, variable: str | None
-) -> None:
-    """Without RELEASE_SOLO_MAINTAINER == 'true' the original binding stands."""
-    case = _release_repo(tmp_path)
-    case["fixtures"][_REVIEWS_KEY] = []
-    case["fixtures"][_AUTHOR_PERMISSION_KEY] = _permission_payload("author", "admin")
-    overrides = {} if variable is None else {"RELEASE_SOLO_MAINTAINER": variable}
-    result = _run_binding(case, tmp_path, **overrides)
-    assert result.returncode != 0
-    assert "no effective eligible non-self approval" in result.stderr
-    assert _SOLO_WAIVER_NOTICE not in result.stdout
-
-
-def test_binding_waives_approval_for_declared_solo_admin_author(tmp_path: Path) -> None:
-    """Variable set, admin author, no eligible reviews: waiver plus audit record."""
-    case = _release_repo(tmp_path)
-    case["fixtures"][_REVIEWS_KEY] = []
-    case["fixtures"][_AUTHOR_PERMISSION_KEY] = _permission_payload("author", "admin")
-    result = _run_binding(case, tmp_path, RELEASE_SOLO_MAINTAINER="true")
     assert result.returncode == 0, result.stderr
-    assert _SOLO_WAIVER_NOTICE in result.stdout
-    summary = (tmp_path / "github-summary").read_text()
-    assert "Solo-maintainer waiver audit" in summary
-    assert "- PR author: `author`" in summary
-    assert "`admin`" in summary
-    assert "Eligible non-author reviewers found: []" in summary
-
-
-def test_binding_ignores_solo_variable_for_non_admin_author(tmp_path: Path) -> None:
-    """A write-not-admin author cannot be waived by the variable alone."""
-    case = _release_repo(tmp_path)
-    case["fixtures"][_REVIEWS_KEY] = []
-    case["fixtures"][_AUTHOR_PERMISSION_KEY] = _permission_payload("author", "write")
-    result = _run_binding(case, tmp_path, RELEASE_SOLO_MAINTAINER="true")
-    assert result.returncode != 0
-    assert "no effective eligible non-self approval" in result.stderr
-    assert _SOLO_WAIVER_NOTICE not in result.stdout
-
-
-def test_binding_prefers_existing_eligible_review_over_waiver(tmp_path: Path) -> None:
-    """An eligible non-author review re-arms the exact-head binding despite the variable."""
-    case = _release_repo(tmp_path)
-    case["fixtures"][_AUTHOR_PERMISSION_KEY] = _permission_payload("author", "admin")
-    result = _run_binding(case, tmp_path, RELEASE_SOLO_MAINTAINER="true")
-    assert result.returncode == 0, result.stderr
-    assert _SOLO_WAIVER_NOTICE not in result.stdout
-
-
-def test_binding_fails_closed_when_author_permission_probe_errors(tmp_path: Path) -> None:
-    """An error probing the author's permission must fail the release, never waive it."""
-    case = _release_repo(tmp_path)
-    case["fixtures"][_REVIEWS_KEY] = []
-    result = _run_binding(case, tmp_path, RELEASE_SOLO_MAINTAINER="true")
-    assert result.returncode != 0
-    assert _SOLO_WAIVER_NOTICE not in result.stdout
 
 
 @pytest.mark.parametrize("step_id", ["assert-clean-source", "seal-source"])
@@ -2299,7 +2144,7 @@ def test_verify_pypi_retries_absent_but_prepare_classifies_once() -> None:
     """Prepare must keep single-pass semantics; only terminal verification retries.
 
     A retrying prepare could wait out genuine absence differently than the
-    reviewed publish gate expects, while a non-retrying terminal verifier fails
+    publish gate expects, while a non-retrying terminal verifier fails
     the happy path on routine PyPI index-propagation lag after publish-pypi.
     """
     prepare_env = _step("prepare-pypi", "classify-pypi-state")["env"]

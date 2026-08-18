@@ -34,38 +34,13 @@ Publishing is a linear seven-job promotion chain:
    pull request. Its first parent is the previous `main`, its second parent is the
    final pull-request head, and the first parent must be an ancestor of that head.
    The PR base is `main`; GitHub's mutable `pull.base.sha` is not used as historical
-   merge evidence. An effective non-self approval covers the exact head, unless
-   the solo-maintainer waiver applies. The waiver fires only when **all** of the
-   following hold: the repository Actions **variable** `RELEASE_SOLO_MAINTAINER`
-   equals `true` (unset or any other value renders empty in the step env and the
-   original assertion stands byte-for-byte); the PR author probes as `admin` via
-   `repos/{repo}/collaborators/{author}/permission` (a solo maintainer is
-   necessarily admin — the variable alone can never waive a mere-write author);
-   and no write-or-higher non-author reviewer has an effective `APPROVED` or
-   `CHANGES_REQUESTED` review on the PR (if one does, the original exact-head
-   binding runs unchanged). A waived run prints an explicit
-   `solo-maintainer waiver` notice into the job log and writes an audit record —
-   variable value, author, probed permission, and the review evidence examined —
-   into the job summary. Any error in the corroboration probe fails closed; an
-   error is never a waiver, and the probe response is indexed strictly so schema
-   drift also fails closed.
-
-   Token-scope facts, verified empirically under this job's exact `GITHUB_TOKEN`
-   permission grants (probe runs 32191036659 and 32191166538, 2026-08-18): the
-   collaborators **list** endpoint (`repos/{repo}/collaborators`) returns HTTP
-   200 with an **empty** list under the job token and must never be used as a
-   binding input; the **per-user** permission endpoint
-   (`repos/{repo}/collaborators/{login}/permission`) works and returns the full
-   permission payload. That is why the waiver corroborates through the per-user
-   endpoint and a declared variable rather than collaborator enumeration.
-
-   Residual admin window (stated honestly): this review binding does **not**
-   prevent bypass by an actor with repository administration rights. Such an
-   actor can set `RELEASE_SOLO_MAINTAINER`, and could equally manage
-   collaborators or branch protection. The variable is accepted precisely
-   because it adds no marginal attacker capability beyond what repo admin
-   already concedes, while being explicit, auditable in the job summary, and
-   revocable in one line. The
+   merge evidence. Review approval is **not** required: this is a
+   solo-maintainer repository, and bot merges and self-merges are explicitly
+   acceptable. (The former non-self approval binding from PR #297 was
+   unsatisfiable here — zero eligible non-self reviewers exist, and the
+   collaborators list endpoint returns an empty list under the job's
+   `GITHUB_TOKEN`, verified empirically in probe runs 32191036659 and
+   32191166538 on 2026-08-18 — so the maintainer removed it.) The
    head's single `CI Success` check must come from GitHub Actions and resolve to a
    successful pull-request run of this repository's `.github/workflows/ci.yml`.
 2. The same job builds once in the official uv/Python 3.13 image pinned by the
@@ -216,21 +191,16 @@ attestation to expose the same GitHub run or attempt as a PyPI-enforced property
 The workflow cannot create or repair these external controls. Verify them before
 unfreezing publication and again during release review:
 
-- `main` is protected: the final release-candidate PR requires review, dismisses
-  stale approval, requires `CI Success`, requires the branch to be up to date,
-  prevents bypass, and is merged with GitHub's **Create a merge commit** method.
-  On a solo-maintainer repository, required review cannot be satisfied by anyone
-  else; the maintainer declares that state by setting the repository Actions
-  variable `RELEASE_SOLO_MAINTAINER` to `true` and may relax the branch
-  protection review requirement accordingly. Restoring full team mode is one
-  line — `gh variable delete RELEASE_SOLO_MAINTAINER` (or set it to anything
-  but `true`) — and an effective write-or-higher non-author review on the
-  release PR re-arms the exact-head binding even while the variable is set.
+- `main` is protected: direct pushes are prevented, `CI Success` is required,
+  the branch must be up to date, bypass is prevented, and the final
+  release-candidate PR is merged with GitHub's **Create a merge commit**
+  method. Review approval is **not** required — this is a solo-maintainer
+  repository and bot/self merges are acceptable.
 - A tag ruleset protects `v*` tags from update and deletion except for the narrow,
   audited recovery operation described below.
-- The `pypi` environment requires an independent reviewer (on a solo-maintainer
-  repository, the maintainer themself — the explicit human promotion decision),
-  limits deployments to protected `v*` tags, and disallows administrator bypass.
+- The `pypi` environment requires a deployment reviewer (the maintainer — the
+  explicit human promotion decision), limits deployments to protected `v*`
+  tags, and disallows administrator bypass.
 - The `testpypi` environment limits deployments to protected `v*` tags.
 - PyPI and TestPyPI trusted-publisher bindings match this repository, the
   `release.yml` workflow, and their respective environment names.
@@ -245,11 +215,8 @@ or mutate repository, environment, or package-index settings.
 
 1. Prepare the final version and every release-tree change in one final candidate
    pull request. `project.version` must equal the intended tag without `v`.
-2. Obtain an effective approval and successful required CI on the exact final head.
-   If the head changes, repeat both gates. On a solo-maintainer repository with
-   `RELEASE_SOLO_MAINTAINER=true` and an admin author, the workflow waives the
-   approval gate (with a logged notice and a job-summary audit record); required
-   CI on the exact head is never waived.
+2. Obtain successful required CI on the exact final head. If the head changes,
+   repeat the gate. Review approval is not required.
 3. Merge with GitHub **Create a merge commit**. Do not squash or rebase.
 4. Confirm no later commit has reached `main`, then create the protected `v*` tag
    on that GitHub merge commit and publish the GitHub Release for the same tag.
@@ -266,7 +233,7 @@ or mutate repository, environment, or package-index settings.
 - If `main` moves before artifact sealing, the second equality check fails and no
   package-index upload occurs. Delete the unpublished or failed GitHub Release and
   its tag using the audited tag-recovery path. Prepare a new final candidate on
-  current `main`, obtain fresh exact-head review and CI, merge it, and create a new
+  current `main`, obtain fresh exact-head CI, merge it, and create a new
   release tag. Do not retarget or recreate the old candidate tag.
 - Movement of `main` after the sealing check does not change the sealed artifact.
   The bound commit/tree/PR/workflow/container and attestation results remain visible
@@ -304,10 +271,10 @@ gh run rerun --repo joyfulhouse/pylxpweb --job "$prepare_job_id"
   terminal verifier completes from the sealed artifact and exact remote bytes.
 - **Partial publication:** MUST preserve the run summaries and package-index
   evidence, treat the version as burned, and prepare a new version through the
-  normal reviewed release process. Never upload the missing file as a top-up.
+  normal release process. Never upload the missing file as a top-up.
 - **Mismatch, yanked, extra, or competing publication:** MUST stop publication,
   preserve all evidence, and begin the compromise assessment below before creating
-  a new reviewed version. Do not normalize, delete, or overwrite remote evidence.
+  a new version. Do not normalize, delete, or overwrite remote evidence.
 - **Uncertain evidence:** MUST NOT approve or publish. Retry only `prepare-pypi`
   and its dependent verifier/classifier path after the transient condition is
   understood. Repeated uncertainty is not evidence of absence.
@@ -336,7 +303,7 @@ If a release workflow or authorized GitHub identity may be compromised:
    keys. Review repository, environment, release, and package-index audit records
    for unauthorized changes or publications.
 4. Restore environments and trusted-publisher bindings only after recovery,
-   identity rotation, artifact verification, and review are complete.
+   identity rotation and artifact verification are complete.
 
 Trusted publishing remains secretless. No long-lived package-index credential is
 introduced for normal publication or recovery.
@@ -368,7 +335,7 @@ the GitHub-hosted release event, protected environments, and trusted publishing.
 ## Troubleshooting
 
 - A source-identity failure means the event tag, project version, commit, tree,
-  tag-resident workflow identity, reviewed merge identity, or freshly fetched
+  tag-resident workflow identity, merged-PR identity, or freshly fetched
   `main` did not agree. Correct the release inputs; do not weaken the check.
 - A TestPyPI verification failure means the remote name, version, filenames,
   yanked state, hashes, or downloaded distributions did not match the sealed
