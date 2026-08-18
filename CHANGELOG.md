@@ -33,8 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (PR [#297](https://github.com/joyfulhouse/pylxpweb/pull/297)):
   source builds require that exact PEP 517 backend, matching the release
   container's bundled uv version so the offline build cannot resolve a
-  different builder. Runtime dependencies and supported Python versions are
-  unchanged.
+  different builder. The pin was restored after a dependency-bump regression
+  in PR [#304](https://github.com/joyfulhouse/pylxpweb/pull/304). Runtime
+  dependencies and supported Python versions are unchanged.
 
 ### Fixed
 
@@ -78,12 +79,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#299](https://github.com/joyfulhouse/pylxpweb/issues/299), PR
   [#303](https://github.com/joyfulhouse/pylxpweb/pull/303)):
   when the release workflow finds the version already on PyPI, it classifies
-  the closed publication state as exact-complete, partial, mismatched, or
-  uncertain instead of failing opaquely. Recovery rediscovers the run-scoped
-  sealed artifacts and verifies their attestations before publishing only
-  ABSENT files — never rebuilding, republishing exact-complete state, using
+  the closed publication state as exact-complete, partial, mismatch, yanked,
+  extra, competing, or uncertain instead of failing opaquely. Recovery
+  rediscovers the run-scoped sealed artifacts and verifies their attestations,
+  and publishes the full sealed wheel/sdist set only when the version is
+  wholly absent from the index — never topping up a partial publication
+  (partial is terminal), rebuilding, republishing exact-complete state, using
   production `skip-existing`, or broadening publisher authority; evidence gaps
-  and remote conflicts fail closed through UNCERTAIN. An unprivileged terminal
+  and remote conflicts fail closed through uncertain. An unprivileged terminal
   verify-pypi job confirms the final index state, and the recovery runbook is
   documented in `.github/WORKFLOWS.md`.
 
