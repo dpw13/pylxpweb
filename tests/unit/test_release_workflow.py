@@ -7,13 +7,18 @@ import http.server
 import json
 import os
 import re
+import shlex
 import shutil
+import signal
 import subprocess
+import sys
 import threading
 import time
+from collections import deque
 from collections.abc import Iterator
+from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 import pytest
 import yaml
@@ -29,6 +34,16 @@ _PACKAGE_INDEX_PUBLISHER = re.compile(
     r"\b(?:twine\s+upload|(?:uv|poetry|hatch|flit|pdm)\s+publish)\b",
     re.IGNORECASE,
 )
+_BINDING_TIMEOUT_SECONDS = 15.0
+_SUBPROCESS_WALL_MULTIPLIER = 20.0
+_SUBPROCESS_TAIL_BYTES = 1 << 20
+_SUBPROCESS_READER_JOIN_SECONDS = 2.0
+# The terminator must be a whole ``PY`` line: without the lookahead a body line
+# merely *starting* with ``PY`` would silently truncate the materialized script.
+_PYTHON_HEREDOC = re.compile(
+    r"python3 -(?P<args>[^\n]*(?:\\\n[^\n]*)*) <<'PY'\n(?P<body>.*?)\nPY(?=\n|$)",
+    re.DOTALL,
+)
 
 
 @pytest.fixture
@@ -39,17 +54,25 @@ def package_index_server() -> Iterator[tuple[str, dict[str, Any]]]:
         "index_calls": 0,
         "index_responses": [],
         "redirected_files": {},
+        "redirected_index": None,
+        "request_events": [],
     }
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802 - stdlib handler contract
             if self.path.startswith("/pypi/"):
+                state["request_events"].append("index")
                 responses = state["index_responses"]
                 index = min(state["index_calls"], len(responses) - 1)
                 state["index_calls"] += 1
                 response = responses[index]
                 if isinstance(response, int):
                     self.send_error(response)
+                    return
+                if isinstance(response, dict) and "redirect" in response:
+                    self.send_response(302)
+                    self.send_header("Location", response["redirect"])
+                    self.end_headers()
                     return
                 body = json.dumps(response).encode()
                 self.send_response(200)
@@ -59,6 +82,7 @@ def package_index_server() -> Iterator[tuple[str, dict[str, Any]]]:
                 self.wfile.write(body)
                 return
             if self.path.startswith("/files/"):
+                state["request_events"].append("file")
                 name = self.path.removeprefix("/files/")
                 response = state["files"][name]
                 if isinstance(response, dict) and "redirect" in response:
@@ -91,6 +115,18 @@ def package_index_server() -> Iterator[tuple[str, dict[str, Any]]]:
                 self.send_header("Content-Length", str(len(response)))
                 self.end_headers()
                 self.wfile.write(response)
+                return
+            if self.path.startswith("/redirected-index"):
+                response = state["redirected_index"]
+                if response is None:
+                    self.send_error(404)
+                    return
+                body = json.dumps(response).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
                 return
             self.send_error(404)
 
@@ -201,13 +237,12 @@ def _run_index_verifier(
         "SOCKET_TIMEOUT_SECONDS": "1",
     }
     env.update(env_overrides or {})
-    return subprocess.run(
-        ["bash", "-c", _step(job_id, f"verify-{job_id.removeprefix('verify-')}-files")["run"]],
+    return _run_yaml_script(
+        _step(job_id, f"verify-{job_id.removeprefix('verify-')}-files")["run"],
         cwd=tmp_path,
         env=env,
-        text=True,
-        capture_output=True,
-        check=False,
+        tmp_path=tmp_path,
+        timeout_seconds=15,
     )
 
 
@@ -401,6 +436,202 @@ def _release_repo(
     }
 
 
+# Pipes whose reader threads were abandoned are parked here for the life of the
+# process instead of being closed: closing them would free the fd numbers for
+# reuse while a zombie reader could still loop, letting it read an unrelated
+# later file that happened to receive the recycled fd number.
+_ABANDONED_PIPES: list[IO[bytes]] = []
+
+
+def _drain_pipe(
+    fd: int,
+    key: str,
+    captured: dict[str, deque[bytes]],
+    retained: dict[str, int],
+    dropped: dict[str, int],
+    capture_tail_bytes: int,
+    last_progress: list[float],
+    abandoned: threading.Event,
+) -> None:
+    """Drain one captured pipe into a bounded tail until EOF or abandonment.
+
+    The abandon event is checked before every read: once the harness gives up
+    on this reader it must never issue another ``os.read``, because the fd
+    number could otherwise be recycled to an unrelated file whose bytes a
+    still-looping zombie reader would steal. OSError also ends the drain when
+    the abandoning thread switches the fd to non-blocking (EAGAIN).
+    """
+    with suppress(OSError, ValueError):
+        while not abandoned.is_set() and (chunk := os.read(fd, 65536)):
+            captured[key].append(chunk)
+            retained[key] += len(chunk)
+            while retained[key] > capture_tail_bytes and len(captured[key]) > 1:
+                oldest = captured[key].popleft()
+                retained[key] -= len(oldest)
+                dropped[key] += len(oldest)
+            if retained[key] > capture_tail_bytes:
+                excess = retained[key] - capture_tail_bytes
+                captured[key][0] = captured[key][0][excess:]
+                retained[key] -= excess
+                dropped[key] += excess
+            last_progress[0] = time.monotonic()
+
+
+def _run_bounded_subprocess(
+    args: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout_seconds: float,
+    wall_timeout_seconds: float | None = None,
+    capture_tail_bytes: int = _SUBPROCESS_TAIL_BYTES,
+) -> subprocess.CompletedProcess[str]:
+    # Two independent deadlines: timeout_seconds bounds *silence* (a child that
+    # keeps writing to either captured pipe stays alive), wall_timeout_seconds
+    # bounds *total runtime* even while output keeps arriving. Either firing
+    # kills the whole process group. Captured output is a bounded tail: only
+    # the most recent capture_tail_bytes per stream are retained, with a
+    # truncation notice when earlier bytes were dropped.
+    if wall_timeout_seconds is None:
+        wall_timeout_seconds = timeout_seconds * _SUBPROCESS_WALL_MULTIPLIER
+    process = subprocess.Popen(
+        args,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+        start_new_session=True,
+    )
+    stdout_pipe = process.stdout
+    stderr_pipe = process.stderr
+    assert stdout_pipe is not None and stderr_pipe is not None
+    captured: dict[str, deque[bytes]] = {"stdout": deque(), "stderr": deque()}
+    retained = {"stdout": 0, "stderr": 0}
+    dropped = {"stdout": 0, "stderr": 0}
+    started = time.monotonic()
+    last_progress = [started]
+    abandoned = threading.Event()
+
+    readers = [
+        threading.Thread(
+            target=_drain_pipe,
+            args=(
+                pipe.fileno(),
+                key,
+                captured,
+                retained,
+                dropped,
+                capture_tail_bytes,
+                last_progress,
+                abandoned,
+            ),
+            daemon=True,
+        )
+        for pipe, key in ((stdout_pipe, "stdout"), (stderr_pipe, "stderr"))
+    ]
+    for reader in readers:
+        reader.start()
+
+    def decoded(key: str) -> str:
+        text = b"".join(captured[key]).decode(errors="replace")
+        if dropped[key]:
+            return f"[... {dropped[key]} bytes dropped ...]\n{text}"
+        return text
+
+    expired_deadline: float | None = None
+    try:
+        while process.poll() is None or any(reader.is_alive() for reader in readers):
+            now = time.monotonic()
+            if now - started >= wall_timeout_seconds:
+                expired_deadline = wall_timeout_seconds
+            elif now - last_progress[0] >= timeout_seconds:
+                expired_deadline = timeout_seconds
+            if expired_deadline is not None:
+                with suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                break
+            time.sleep(0.01)
+    except BaseException:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        raise
+    finally:
+        # A descendant that re-setsid'd or double-forked survives the group
+        # SIGKILL and keeps the captured pipes open, so joins must be bounded
+        # or pytest hangs despite both deadlines. On join expiry the readers
+        # are abandoned, never woken by force: close() from this thread would
+        # not interrupt a reader blocked in os.read (the syscall holds the old
+        # file description) and would free the fd numbers for reuse, letting a
+        # still-looping reader steal bytes from an unrelated later file. So
+        # instead the abandon event guarantees no reader issues a new os.read,
+        # the fds are switched to non-blocking so a not-yet-blocked read fails
+        # fast, and the pipe objects are parked module-globally, never closed,
+        # so their fd numbers cannot be recycled. A reader already blocked in
+        # os.read may stay blocked; the daemon flag plus the bounded joins are
+        # the backstop that keeps pytest exit and this harness prompt.
+        deadline = time.monotonic() + _SUBPROCESS_READER_JOIN_SECONDS
+        for reader in readers:
+            reader.join(timeout=max(0.0, deadline - time.monotonic()))
+        if any(reader.is_alive() for reader in readers):
+            abandoned.set()
+            for pipe in (stdout_pipe, stderr_pipe):
+                with suppress(OSError, ValueError):
+                    os.set_blocking(pipe.fileno(), False)
+            deadline = time.monotonic() + _SUBPROCESS_READER_JOIN_SECONDS
+            for reader in readers:
+                reader.join(timeout=max(0.0, deadline - time.monotonic()))
+        if any(reader.is_alive() for reader in readers):
+            _ABANDONED_PIPES.extend((stdout_pipe, stderr_pipe))
+        else:
+            stdout_pipe.close()
+            stderr_pipe.close()
+        returncode = process.wait()
+    if expired_deadline is not None:
+        raise subprocess.TimeoutExpired(
+            args,
+            expired_deadline,
+            output=decoded("stdout"),
+            stderr=decoded("stderr"),
+        )
+    return subprocess.CompletedProcess(args, returncode, decoded("stdout"), decoded("stderr"))
+
+
+def _materialize_python_heredocs(script: str, tmp_path: Path) -> str:
+    script_dir = tmp_path / "yaml-script"
+    script_dir.mkdir(exist_ok=True)
+    heredoc_count = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal heredoc_count
+        body_path = script_dir / f"heredoc-{heredoc_count}.py"
+        heredoc_count += 1
+        body_path.write_text(match.group("body") + "\n")
+        return f"python3 {shlex.quote(str(body_path))}{match.group('args')}"
+
+    materialized = _PYTHON_HEREDOC.sub(replace, script)
+    assert heredoc_count == script.count("<<'PY'")
+    assert "<<'PY'" not in materialized
+    return materialized
+
+
+def _run_yaml_script(
+    script: str,
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    tmp_path: Path,
+    timeout_seconds: float,
+) -> subprocess.CompletedProcess[str]:
+    return _run_bounded_subprocess(
+        ["bash", "-c", _materialize_python_heredocs(script, tmp_path)],
+        cwd=cwd,
+        env=env,
+        timeout_seconds=timeout_seconds,
+    )
+
+
 def _run_binding(
     case: dict[str, Any], tmp_path: Path, **env_overrides: str
 ) -> subprocess.CompletedProcess[str]:
@@ -418,6 +649,9 @@ def _run_binding(
         "GITHUB_OUTPUT": str(output),
         "GITHUB_STEP_SUMMARY": str(summary),
         "GH_FIXTURES": str(fixtures_path),
+        "GH_PROMPT_DISABLED": "1",
+        "GCM_INTERACTIVE": "Never",
+        "GIT_TERMINAL_PROMPT": "0",
         "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
         "RELEASE_DRAFT": "false",
         "RELEASE_TAG": "v1.2.3",
@@ -426,14 +660,263 @@ def _run_binding(
         "WORKFLOW_SHA": case["merge"],
     }
     env.update(env_overrides)
-    return subprocess.run(
-        ["bash", "-c", _step("bind-build-attest", "bind-source")["run"]],
+    return _run_yaml_script(
+        _step("bind-build-attest", "bind-source")["run"],
         cwd=repo,
         env=env,
-        text=True,
-        capture_output=True,
-        check=False,
+        tmp_path=tmp_path,
+        timeout_seconds=_BINDING_TIMEOUT_SECONDS,
     )
+
+
+def _assert_reader_threads_settled(threads_before: int) -> None:
+    """Reader threads must wind down after the harness returns.
+
+    Uses a bounded retry and a ``<=`` comparison instead of exact equality:
+    unrelated interpreter threads can start or stop under load, and exact
+    ``threading.active_count()`` equality is flaky on loaded CI runners.
+    """
+    deadline = time.monotonic() + 5.0
+    while threading.active_count() > threads_before and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert threading.active_count() <= threads_before
+
+
+def test_bounded_subprocess_terminates_entire_child_group(tmp_path: Path) -> None:
+    """A timed-out shell must not leave descendants holding captured pipes open."""
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        _run_bounded_subprocess(
+            ["bash", "-c", "sleep 60 & wait"],
+            cwd=tmp_path,
+            env=os.environ.copy(),
+            timeout_seconds=0.2,
+        )
+    assert time.monotonic() - started < 2
+
+
+def test_bounded_subprocess_join_stays_bounded_when_descendant_escapes_group(
+    tmp_path: Path,
+) -> None:
+    """A re-setsid'd descendant surviving the group SIGKILL cannot hang pytest.
+
+    The escaped child inherits the captured pipes and keeps them open for 30
+    seconds after the group is killed, so an unbounded ``reader.join()`` would
+    block until the child exits. The harness must instead give up on the
+    readers within its bounded join budget and raise the timeout promptly.
+    """
+    escaped = (
+        f"{shlex.quote(sys.executable)} -c "
+        '"import os, time; os.setsid(); time.sleep(30)" & sleep 30'
+    )
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        _run_bounded_subprocess(
+            ["bash", "-c", escaped],
+            cwd=tmp_path,
+            env=os.environ.copy(),
+            timeout_seconds=0.3,
+        )
+    assert time.monotonic() - started < 15
+
+
+def test_drain_pipe_never_issues_a_read_once_abandoned() -> None:
+    """An abandoned drain must not touch its fd again, even with bytes pending.
+
+    After the harness abandons a reader, its fd number must be treated as
+    poisoned: one more ``os.read`` from a zombie reader could consume bytes
+    from an unrelated file if the number were ever recycled. The abandon event
+    is therefore checked before every read, so a drain entered (or resumed)
+    after abandonment returns without consuming the pending bytes.
+    """
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, b"pending bytes")
+        os.close(write_fd)
+        write_fd = -1
+        captured: dict[str, deque[bytes]] = {"stdout": deque()}
+        abandoned = threading.Event()
+        abandoned.set()
+        _drain_pipe(
+            read_fd,
+            "stdout",
+            captured,
+            {"stdout": 0},
+            {"stdout": 0},
+            _SUBPROCESS_TAIL_BYTES,
+            [time.monotonic()],
+            abandoned,
+        )
+        assert not captured["stdout"]
+        assert os.read(read_fd, 65536) == b"pending bytes"
+    finally:
+        os.close(read_fd)
+        if write_fd != -1:
+            os.close(write_fd)
+
+
+def test_heredoc_materialization_keeps_body_lines_starting_with_py(tmp_path: Path) -> None:
+    """A heredoc body line starting with ``PY`` is body, not the terminator.
+
+    Without a line-anchored terminator the materialized script is silently
+    truncated at the first ``PY``-prefixed body line and the sync assertions
+    in ``_materialize_python_heredocs`` cannot catch it.
+    """
+    script = "python3 - <<'PY'\nx = 1\nPY_MARKER = 2\nprint(x + PY_MARKER)\nPY\n"
+    materialized = _materialize_python_heredocs(script, tmp_path)
+    body_path = tmp_path / "yaml-script" / "heredoc-0.py"
+    assert body_path.read_text() == "x = 1\nPY_MARKER = 2\nprint(x + PY_MARKER)\n"
+    assert "PY_MARKER" not in materialized
+
+
+def test_bounded_subprocess_tolerates_slow_but_progressing_child(tmp_path: Path) -> None:
+    """The deadline bounds silence, not total runtime.
+
+    A child whose output gaps stay under the deadline must run to completion
+    even when its total runtime exceeds the deadline several times over, and
+    the harness must not leave reader threads behind afterwards. The 1-second
+    silence deadline leaves ~20x margin over the 0.05-second cadence so a
+    loaded CI runner cannot stretch one gap past the deadline.
+    """
+    threads_before = threading.active_count()
+    result = _run_bounded_subprocess(
+        ["bash", "-c", 'for i in $(seq 60); do echo "tick $i"; sleep 0.05; done'],
+        cwd=tmp_path,
+        env=os.environ.copy(),
+        timeout_seconds=1.0,
+    )
+    assert result.returncode == 0
+    assert result.stdout.splitlines() == [f"tick {i}" for i in range(1, 61)]
+    _assert_reader_threads_settled(threads_before)
+
+
+def test_bounded_subprocess_kills_child_that_stops_progressing(tmp_path: Path) -> None:
+    """Progress followed by silence is still killed, with the whole group."""
+    threads_before = threading.active_count()
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired) as excinfo:
+        _run_bounded_subprocess(
+            ["bash", "-c", 'echo "made progress"; sleep 60 & wait'],
+            cwd=tmp_path,
+            env=os.environ.copy(),
+            timeout_seconds=0.3,
+        )
+    assert time.monotonic() - started < 2
+    assert "made progress" in (excinfo.value.output or "")
+    _assert_reader_threads_settled(threads_before)
+
+
+def test_bounded_subprocess_enforces_wall_deadline_despite_progress(tmp_path: Path) -> None:
+    """A child that keeps emitting output must still die at the wall deadline."""
+    threads_before = threading.active_count()
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired) as excinfo:
+        _run_bounded_subprocess(
+            ["bash", "-c", 'while true; do echo "still alive"; sleep 0.02; done'],
+            cwd=tmp_path,
+            env=os.environ.copy(),
+            timeout_seconds=5.0,
+            wall_timeout_seconds=0.4,
+        )
+    assert time.monotonic() - started < 3
+    assert excinfo.value.timeout == 0.4
+    assert "still alive" in (excinfo.value.output or "")
+    _assert_reader_threads_settled(threads_before)
+
+
+def test_bounded_subprocess_default_wall_deadline_is_finite() -> None:
+    """Omitting the wall deadline must still yield a hard total-runtime bound."""
+    assert _SUBPROCESS_WALL_MULTIPLIER > 1
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired) as excinfo:
+        _run_bounded_subprocess(
+            ["bash", "-c", 'while true; do echo "still alive"; done'],
+            cwd=Path.cwd(),
+            env=os.environ.copy(),
+            timeout_seconds=0.1,
+        )
+    assert time.monotonic() - started < 5
+    assert excinfo.value.timeout == pytest.approx(0.1 * _SUBPROCESS_WALL_MULTIPLIER)
+
+
+def test_bounded_subprocess_retains_bounded_tail_of_output(tmp_path: Path) -> None:
+    """Retained output stays bounded while the diagnostic tail survives."""
+    result = _run_bounded_subprocess(
+        ["bash", "-c", 'for i in $(seq 2000); do echo "line $i"; done'],
+        cwd=tmp_path,
+        env=os.environ.copy(),
+        timeout_seconds=5.0,
+        capture_tail_bytes=1024,
+    )
+    assert result.returncode == 0
+    assert len(result.stdout.encode()) < 1024 + 200
+    assert result.stdout.startswith("[... ")
+    assert "bytes dropped ...]" in result.stdout
+    assert result.stdout.rstrip().endswith("line 2000")
+
+
+def test_bounded_subprocess_bounds_memory_of_endlessly_emitting_child(tmp_path: Path) -> None:
+    """A killed chatty child leaves a bounded diagnostic, not unbounded capture."""
+    with pytest.raises(subprocess.TimeoutExpired) as excinfo:
+        _run_bounded_subprocess(
+            ["bash", "-c", 'while true; do echo "flood flood flood flood"; done'],
+            cwd=tmp_path,
+            env=os.environ.copy(),
+            timeout_seconds=5.0,
+            wall_timeout_seconds=0.4,
+            capture_tail_bytes=2048,
+        )
+    output = excinfo.value.output or ""
+    assert len(output.encode()) < 2048 + 200
+    assert "flood" in output
+
+
+def test_harness_never_hands_bash_a_python_heredoc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every workflow heredoc must be a private file before bash parses the script.
+
+    Homebrew Bash 5.3 on macOS can deadlock in heredoc_write under load, so the
+    harness removes the heredoc construct entirely instead of racing the pipe.
+    This checks the command actually handed to bash for every heredoc-bearing
+    workflow script: no ``<<'PY'`` survives, each body is byte-identical on
+    disk, and the interpreter arguments are preserved.
+    """
+    scripts = [
+        text
+        for job in _workflow()["jobs"].values()
+        for step in job["steps"]
+        for text in [step.get("run")]
+        if isinstance(text, str) and "<<'PY'" in text
+    ]
+    assert scripts, "release.yml no longer contains python heredocs to materialize"
+    executed: list[list[str]] = []
+
+    def record(
+        args: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        timeout_seconds: float,
+    ) -> subprocess.CompletedProcess[str]:
+        executed.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(sys.modules[__name__], "_run_bounded_subprocess", record)
+    for index, script in enumerate(scripts):
+        script_tmp = tmp_path / str(index)
+        script_tmp.mkdir()
+        _run_yaml_script(script, cwd=script_tmp, env={}, tmp_path=script_tmp, timeout_seconds=1.0)
+        executable, flag, command = executed[-1]
+        assert (executable, flag) == ("bash", "-c")
+        assert "<<'PY'" not in command
+        heredocs = list(_PYTHON_HEREDOC.finditer(script))
+        assert len(heredocs) == script.count("<<'PY'")
+        for heredoc_index, heredoc in enumerate(heredocs):
+            body_path = script_tmp / "yaml-script" / f"heredoc-{heredoc_index}.py"
+            invocation = f"python3 {shlex.quote(str(body_path))}{heredoc.group('args')}"
+            assert invocation in command
+            assert body_path.read_text() == heredoc.group("body") + "\n"
 
 
 @pytest.mark.parametrize("lightweight", [False, True], ids=["annotated", "lightweight"])
@@ -793,13 +1276,12 @@ def test_source_tree_checks_reject_mutable_build_inputs(
     else:
         repo.joinpath("build-input.py").write_text("MUTATED = True\n")
     env = os.environ | {"EXPECTED_COMMIT": case["merge"]}
-    result = subprocess.run(
-        ["bash", "-c", _step("bind-build-attest", step_id)["run"]],
+    result = _run_yaml_script(
+        _step("bind-build-attest", step_id)["run"],
         cwd=repo,
         env=env,
-        text=True,
-        capture_output=True,
-        check=False,
+        tmp_path=tmp_path,
+        timeout_seconds=15,
     )
     assert result.returncode != 0
     assert "source tree" in result.stderr.lower()
@@ -814,13 +1296,12 @@ def test_sealing_allows_only_the_expected_release_bundle(tmp_path: Path) -> None
     output.mkdir(parents=True)
     output.joinpath("expected.whl").write_bytes(b"expected output")
     env = os.environ | {"EXPECTED_COMMIT": case["merge"]}
-    result = subprocess.run(
-        ["bash", "-c", _step("bind-build-attest", "seal-source")["run"]],
+    result = _run_yaml_script(
+        _step("bind-build-attest", "seal-source")["run"],
         cwd=repo,
         env=env,
-        text=True,
-        capture_output=True,
-        check=False,
+        tmp_path=tmp_path,
+        timeout_seconds=15,
     )
     assert result.returncode == 0, result.stderr
 
@@ -835,13 +1316,12 @@ def test_sealing_rechecks_fresh_main_immediately_before_attestation(tmp_path: Pa
     subprocess.run(["git", "push", "-q", "origin", "main"], cwd=repo, check=True)
     subprocess.run(["git", "checkout", "-q", "--detach", "v1.2.3"], cwd=repo, check=True)
     env = os.environ | {"EXPECTED_COMMIT": case["merge"]}
-    result = subprocess.run(
-        ["bash", "-c", _step("bind-build-attest", "seal-source")["run"]],
+    result = _run_yaml_script(
+        _step("bind-build-attest", "seal-source")["run"],
         cwd=repo,
         env=env,
-        text=True,
-        capture_output=True,
-        check=False,
+        tmp_path=tmp_path,
+        timeout_seconds=15,
     )
     assert result.returncode != 0
     assert "current main" in result.stderr.lower()
@@ -1021,10 +1501,20 @@ def test_bundle_validation_rejects_artifact_and_attestation_tampering(tmp_path: 
     }
     env.pop("GH_TOKEN", None)
     run = _step("prepare-testpypi", "verify-release-bundle")["run"]
-    missing_auth = subprocess.run(["bash", "-c", run], cwd=tmp_path, env=env, check=False)
+
+    def run_verifier(script: str) -> subprocess.CompletedProcess[str]:
+        return _run_yaml_script(
+            script,
+            cwd=tmp_path,
+            env=env,
+            tmp_path=tmp_path,
+            timeout_seconds=15,
+        )
+
+    missing_auth = run_verifier(run)
     assert missing_auth.returncode != 0
     env["GH_TOKEN"] = "scoped-test-token"
-    good = subprocess.run(["bash", "-c", run], cwd=tmp_path, env=env, check=False)
+    good = run_verifier(run)
     assert good.returncode == 0
     calls = (tmp_path / "gh-calls").read_text().splitlines()
     assert len(calls) == 3
@@ -1056,33 +1546,30 @@ def test_bundle_validation_rejects_artifact_and_attestation_tampering(tmp_path: 
     for label, (expected, replacement) in identity_mutations.items():
         assert expected in run, label
         mutated = run.replace(expected, replacement, 1)
-        result = subprocess.run(["bash", "-c", mutated], cwd=tmp_path, env=env, check=False)
+        result = run_verifier(mutated)
         assert result.returncode != 0, label
     wheel.write_bytes(b"tampered")
-    tampered_artifact = subprocess.run(["bash", "-c", run], cwd=tmp_path, env=env, check=False)
+    tampered_artifact = run_verifier(run)
     assert tampered_artifact.returncode != 0
     wheel.write_bytes(b"wheel")
     env["EXPECTED_ATTESTATION_CONTENT"] = "not-the-bundle"
-    tampered_attestation = subprocess.run(["bash", "-c", run], cwd=tmp_path, env=env, check=False)
+    tampered_attestation = run_verifier(run)
     assert tampered_attestation.returncode != 0
 
 
-@pytest.mark.parametrize("job_id", ["verify-testpypi", "verify-pypi"])
 def test_index_verifier_retries_then_accepts_exact_remote_bytes(
     tmp_path: Path,
     package_index_server: tuple[str, dict[str, Any]],
-    job_id: str,
 ) -> None:
     """The YAML-derived verifier handles transient index lag and exact bytes."""
     base_url, state = package_index_server
     _, payload = _prepare_index_case(tmp_path, base_url, state)
     state["index_responses"] = [503, payload]
-    result = _run_index_verifier(tmp_path, base_url, job_id=job_id)
+    result = _run_index_verifier(tmp_path, base_url, job_id="verify-testpypi")
     assert result.returncode == 0, result.stderr
     assert state["index_calls"] >= 2
 
 
-@pytest.mark.parametrize("job_id", ["verify-testpypi", "verify-pypi"])
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -1101,7 +1588,6 @@ def test_index_verifier_retries_then_accepts_exact_remote_bytes(
 def test_index_verifier_rejects_remote_identity_and_byte_mutations(
     tmp_path: Path,
     package_index_server: tuple[str, dict[str, Any]],
-    job_id: str,
     mutation: str,
 ) -> None:
     """Weakening any remote-index check admits a different published artifact set."""
@@ -1140,15 +1626,13 @@ def test_index_verifier_rejects_remote_identity_and_byte_mutations(
         state["index_responses"] = [503, 503, 503]
     if not state["index_responses"]:
         state["index_responses"] = [payload]
-    result = _run_index_verifier(tmp_path, base_url, job_id=job_id)
+    result = _run_index_verifier(tmp_path, base_url, job_id="verify-testpypi")
     assert result.returncode != 0
 
 
-@pytest.mark.parametrize("job_id", ["verify-testpypi", "verify-pypi"])
 def test_index_verifier_rejects_competing_publication_race(
     tmp_path: Path,
     package_index_server: tuple[str, dict[str, Any]],
-    job_id: str,
 ) -> None:
     """A second index snapshot catches a file added while exact bytes are downloaded."""
     base_url, state = package_index_server
@@ -1163,18 +1647,15 @@ def test_index_verifier_rejects_competing_publication_race(
         }
     )
     state["index_responses"] = [exact, raced]
-    result = _run_index_verifier(tmp_path, base_url, job_id=job_id)
+    result = _run_index_verifier(tmp_path, base_url, job_id="verify-testpypi")
     assert result.returncode != 0
     assert state["index_calls"] == 2
 
 
-@pytest.mark.parametrize("job_id", ["verify-testpypi", "verify-pypi"])
-def test_index_verifier_worst_case_fits_job_timeout_with_five_minute_headroom(
-    job_id: str,
-) -> None:
+def test_index_verifier_worst_case_fits_job_timeout_with_five_minute_headroom() -> None:
     """Polling, transfers, final snapshot, and non-index verification fit mechanically."""
-    job = _job(job_id)
-    step = _step(job_id, f"verify-{job_id.removeprefix('verify-')}-files")
+    job = _job("verify-testpypi")
+    step = _step("verify-testpypi", "verify-testpypi-files")
     env = step["env"]
     attempts = int(env["MAX_ATTEMPTS"])
     retry_base = int(env["RETRY_BASE_SECONDS"])
@@ -1212,37 +1693,696 @@ def test_index_verifier_enforces_total_deadline_despite_socket_activity(
     assert result.returncode != 0
 
 
-@pytest.mark.parametrize(
-    ("response", "expected_success"),
-    [(404, True), ("existing", False), (503, False)],
-    ids=["absent", "pre-existing", "unexpected-error"],
-)
-def test_pypi_absence_check_uses_controlled_index_and_fails_closed(
+def _read_output(path: Path, key: str) -> str:
+    """Read the last scalar written for a GitHub Actions output."""
+    prefix = f"{key}="
+    return next(
+        line.removeprefix(prefix)
+        for line in reversed(path.read_text().splitlines())
+        if line.startswith(prefix)
+    )
+
+
+def _run_pypi_classifier(
     tmp_path: Path,
-    package_index_server: tuple[str, dict[str, Any]],
-    response: int | str,
-    expected_success: bool,
-) -> None:
-    """The exact prepare path accepts only a 404 and rejects an occupied version."""
-    base_url, state = package_index_server
-    state["index_responses"] = [
-        _index_payload(base_url, {}) if response == "existing" else response
-    ]
+    base_url: str,
+    *,
+    env_overrides: dict[str, str] | None = None,
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    output = tmp_path / "prepare-pypi-output"
+    summary = tmp_path / "prepare-pypi-summary"
     env = os.environ | {
+        "ALLOWED_FILE_HOST": "127.0.0.1",
+        "ALLOWED_INDEX_HOST": "127.0.0.1",
+        "DOWNLOAD_TOTAL_SECONDS": "2",
         "EXPECTED_PROJECT_NAME": "pylxpweb",
         "EXPECTED_VERSION": "1.2.3",
-        "PYPI_JSON_BASE": f"{base_url}/pypi",
+        "GITHUB_OUTPUT": str(output),
+        "GITHUB_STEP_SUMMARY": str(summary),
+        "INDEX_JSON_BASE": f"{base_url}/pypi",
+        "INDEX_TOTAL_SECONDS": "2",
+        "REQUIRED_FILE_SCHEME": "http",
+        "REQUIRED_INDEX_SCHEME": "http",
+        "SNAPSHOT_DELAY_SECONDS": "0",
+        "SOCKET_TIMEOUT_SECONDS": "1",
     }
-    result = subprocess.run(
-        ["bash", "-c", _step("prepare-pypi", "verify-pypi-absence")["run"]],
+    env.update(env_overrides or {})
+    result = _run_yaml_script(
+        _step("prepare-pypi", "classify-pypi-state")["run"],
         cwd=tmp_path,
         env=env,
-        text=True,
-        capture_output=True,
-        check=False,
+        tmp_path=tmp_path,
+        timeout_seconds=15,
     )
-    assert state["index_calls"] == 1
-    assert (result.returncode == 0) is expected_success
+    state = _read_output(output, "state") if output.exists() else ""
+    return result, state
+
+
+@pytest.mark.parametrize(
+    ("remote_case", "expected_state"),
+    [
+        ("absent", "ABSENT"),
+        ("exact", "EXACT_COMPLETE"),
+        ("partial", "PARTIAL"),
+        ("mismatch", "MISMATCH"),
+        ("yanked", "YANKED"),
+        ("extra", "EXTRA"),
+        ("competing", "COMPETING"),
+        ("uncertain", "UNCERTAIN"),
+    ],
+)
+def test_pypi_classifier_emits_closed_state_machine_from_remote_bytes(
+    tmp_path: Path,
+    package_index_server: tuple[str, dict[str, Any]],
+    remote_case: str,
+    expected_state: str,
+) -> None:
+    """Deleting any state branch makes an immutable remote state publishable or ambiguous."""
+    base_url, server = package_index_server
+    files, payload = _prepare_index_case(tmp_path, base_url, server)
+    if remote_case == "absent":
+        server["index_responses"] = [404, 404]
+    elif remote_case == "partial":
+        payload["urls"] = payload["urls"][:1]
+    elif remote_case == "mismatch":
+        payload["urls"][0]["digests"]["sha256"] = "0" * 64
+    elif remote_case == "yanked":
+        payload["urls"][0]["yanked"] = True
+    elif remote_case == "extra":
+        payload["urls"].append(
+            {
+                "digests": {"sha256": hashlib.sha256(b"extra").hexdigest()},
+                "filename": "pylxpweb-1.2.3.zip",
+                "url": f"{base_url}/files/pylxpweb-1.2.3.zip",
+                "yanked": False,
+            }
+        )
+    elif remote_case == "competing":
+        payload["urls"].append(dict(payload["urls"][0]))
+    elif remote_case == "uncertain":
+        server["index_responses"] = [503, 503]
+    if not server["index_responses"]:
+        server["index_responses"] = [payload, payload]
+    result, state = _run_pypi_classifier(tmp_path, base_url)
+    assert result.returncode == 0, result.stderr
+    assert state == expected_state
+    summary = (tmp_path / "prepare-pypi-summary").read_text()
+    assert "Expected sealed files" in summary
+    assert "First snapshot" in summary
+    assert "Second snapshot" in summary
+    if expected_state == "EXACT_COMPLETE":
+        assert server["files"] == files
+        assert server["request_events"][0] == "index"
+        assert server["request_events"][-1] == "index"
+        assert "file" in server["request_events"][1:-1]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "advertised-host",
+        "redirect-host",
+        "metadata-hash",
+        "downloaded-bytes",
+        "inconsistent-snapshots",
+        "malformed-json",
+        "partial-metadata-hash",
+        "partial-advertised-host",
+        "partial-downloaded-bytes",
+        "partial-redirect-host",
+        "extra-metadata-hash",
+        "extra-downloaded-bytes",
+        "index-redirect-host",
+        "index-redirect-absent",
+    ],
+)
+def test_pypi_classifier_never_publishes_untrusted_or_unstable_evidence(
+    tmp_path: Path,
+    package_index_server: tuple[str, dict[str, Any]],
+    mutation: str,
+) -> None:
+    """Weakening host/hash/byte/snapshot checks can misclassify occupied PyPI as absent."""
+    base_url, server = package_index_server
+    files, payload = _prepare_index_case(tmp_path, base_url, server)
+    localhost_base = base_url.replace("127.0.0.1", "localhost")
+    expected = "MISMATCH"
+    if mutation.startswith("partial-"):
+        payload["urls"] = payload["urls"][:1]
+    elif mutation.startswith("extra-"):
+        payload["urls"].append(
+            {
+                "digests": {"sha256": hashlib.sha256(b"extra").hexdigest()},
+                "filename": "pylxpweb-1.2.3.zip",
+                "url": f"{base_url}/files/pylxpweb-1.2.3.zip",
+                "yanked": False,
+            }
+        )
+    if mutation in {"advertised-host", "partial-advertised-host"}:
+        payload["urls"][0]["url"] = payload["urls"][0]["url"].replace("127.0.0.1", "localhost")
+    elif mutation in {"redirect-host", "partial-redirect-host"}:
+        name = payload["urls"][0]["filename"]
+        server["redirected_files"][name] = files[name]
+        server["files"][name] = {"redirect": f"{localhost_base}/redirected/{name}"}
+    elif mutation in {"metadata-hash", "partial-metadata-hash", "extra-metadata-hash"}:
+        payload["urls"][0]["digests"]["sha256"] = "0" * 64
+    elif mutation in {"downloaded-bytes", "partial-downloaded-bytes", "extra-downloaded-bytes"}:
+        server["files"][payload["urls"][0]["filename"]] = b"tampered"
+    elif mutation == "inconsistent-snapshots":
+        changed = json.loads(json.dumps(payload))
+        changed["urls"][0]["yanked"] = True
+        server["index_responses"] = [payload, changed]
+        expected = "UNCERTAIN"
+    elif mutation == "malformed-json":
+        server["index_responses"] = ["not-an-object", "not-an-object"]
+        expected = "UNCERTAIN"
+    elif mutation == "index-redirect-host":
+        server["redirected_index"] = payload
+        redirect = {"redirect": f"{localhost_base}/redirected-index"}
+        server["index_responses"] = [redirect, redirect]
+        expected = "UNCERTAIN"
+    elif mutation == "index-redirect-absent":
+        redirect = {"redirect": f"{localhost_base}/missing-index"}
+        server["index_responses"] = [redirect, redirect]
+        expected = "UNCERTAIN"
+    if not server["index_responses"]:
+        server["index_responses"] = [payload, payload]
+    result, state = _run_pypi_classifier(tmp_path, base_url)
+    assert result.returncode == 0, result.stderr
+    assert state == expected
+    assert state != "ABSENT"
+
+
+def test_recovery_recomputes_state_from_mutable_remote_without_rebuilding(
+    tmp_path: Path,
+    package_index_server: tuple[str, dict[str, Any]],
+) -> None:
+    """Caching prepare output would miss an upload accepted after a lost publisher response."""
+    base_url, server = package_index_server
+    _, payload = _prepare_index_case(tmp_path, base_url, server)
+    server["index_responses"] = [404, 404]
+    first, first_state = _run_pypi_classifier(tmp_path, base_url)
+    server["index_calls"] = 0
+    server["index_responses"] = [payload, payload]
+    second, second_state = _run_pypi_classifier(tmp_path, base_url)
+    assert first.returncode == second.returncode == 0
+    assert (first_state, second_state) == ("ABSENT", "EXACT_COMPLETE")
+    assert _job("prepare-pypi")["needs"] == ["bind-build-attest", "verify-testpypi"]
+    assert "bind-build-attest" not in _job("prepare-pypi").get("if", "")
+
+
+def _artifact_fixture(expected_name: str, expected_digest: str) -> dict[str, Any]:
+    run_id = 12345
+    commit = "a" * 40
+    repository = "joyfulhouse/pylxpweb"
+    artifact = {
+        "id": 987,
+        "name": expected_name,
+        "expired": False,
+        "digest": expected_digest,
+        "workflow_run": {
+            "id": run_id,
+            "head_sha": commit,
+            "repository_id": 42,
+            "head_repository_id": 42,
+        },
+    }
+    return {
+        f"repos/{repository}/actions/runs/{run_id}": {
+            "id": run_id,
+            "event": "release",
+            "head_sha": commit,
+            "path": ".github/workflows/release.yml",
+            "repository": {"id": 42, "full_name": repository},
+            "head_repository": {"id": 42, "full_name": repository},
+        },
+        f"repos/{repository}/actions/runs/{run_id}/artifacts": {
+            "total_count": 1,
+            "artifacts": [artifact],
+        },
+    }
+
+
+def _run_artifact_resolution(
+    tmp_path: Path,
+    fixtures: dict[str, Any],
+    *,
+    expected_digest: str = "d" * 64,
+) -> subprocess.CompletedProcess[str]:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    _write_fake_gh(bin_dir)
+    fixtures_path = tmp_path / "artifact-fixtures.json"
+    fixtures_path.write_text(json.dumps(fixtures))
+    env = os.environ | {
+        "EXPECTED_ARTIFACT_DIGEST": expected_digest,
+        "EXPECTED_ARTIFACT_NAME": "pylxpweb-release-1.2.3-aaaaaaaaaaaa",
+        "EXPECTED_COMMIT": "a" * 40,
+        "GH_FIXTURES": str(fixtures_path),
+        "GITHUB_OUTPUT": str(tmp_path / "artifact-output"),
+        "GITHUB_STEP_SUMMARY": str(tmp_path / "artifact-summary"),
+        "GH_TOKEN": "scoped-test-token",
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "REPOSITORY": "joyfulhouse/pylxpweb",
+        "RUN_ID": "12345",
+    }
+    return _run_yaml_script(
+        _step("prepare-pypi", "resolve-release-artifact")["run"],
+        cwd=tmp_path,
+        env=env,
+        tmp_path=tmp_path,
+        timeout_seconds=15,
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing",
+        "expired",
+        "duplicate",
+        "count-mismatch",
+        "wrong-envelope",
+        "wrong-name",
+        "wrong-digest",
+        "wrong-action-digest-format",
+        "wrong-run",
+        "wrong-head",
+        "wrong-repository",
+    ],
+)
+def test_prepare_rediscovers_one_exact_nonexpired_run_artifact(
+    tmp_path: Path, mutation: str
+) -> None:
+    """Trusting only stale job outputs can select missing, replaced, or cross-run bytes."""
+    name = "pylxpweb-release-1.2.3-aaaaaaaaaaaa"
+    digest = "sha256:" + "d" * 64
+    fixtures = _artifact_fixture(name, digest)
+    page = fixtures["repos/joyfulhouse/pylxpweb/actions/runs/12345/artifacts"]
+    artifacts = page["artifacts"]
+    artifact = artifacts[0]
+    run = fixtures["repos/joyfulhouse/pylxpweb/actions/runs/12345"]
+    if mutation == "missing":
+        artifacts.clear()
+        page["total_count"] = 0
+    elif mutation == "expired":
+        artifact["expired"] = True
+    elif mutation == "duplicate":
+        artifacts.append(dict(artifact, id=988))
+        page["total_count"] = 2
+    elif mutation == "count-mismatch":
+        page["total_count"] = 2
+    elif mutation == "wrong-envelope":
+        fixtures["repos/joyfulhouse/pylxpweb/actions/runs/12345/artifacts"] = artifacts
+    elif mutation == "wrong-name":
+        artifact["name"] = "attacker-artifact"
+    elif mutation == "wrong-digest":
+        artifact["digest"] = "sha256:" + "0" * 64
+    elif mutation == "wrong-run":
+        artifact["workflow_run"]["id"] = 54321
+    elif mutation == "wrong-head":
+        artifact["workflow_run"]["head_sha"] = "b" * 40
+    elif mutation == "wrong-repository":
+        run["repository"]["full_name"] = "attacker/pylxpweb"
+    expected_digest = "sha256:" + "d" * 64 if mutation == "wrong-action-digest-format" else "d" * 64
+    result = _run_artifact_resolution(tmp_path, fixtures, expected_digest=expected_digest)
+    assert result.returncode != 0
+
+
+def test_prepare_accepts_exact_run_artifact_and_binds_download_by_id(tmp_path: Path) -> None:
+    """The accepted API identity must drive the immutable artifact download selector."""
+    name = "pylxpweb-release-1.2.3-aaaaaaaaaaaa"
+    digest = "sha256:" + "d" * 64
+    result = _run_artifact_resolution(tmp_path, _artifact_fixture(name, digest))
+    assert result.returncode == 0, result.stderr
+    output = tmp_path / "artifact-output"
+    assert _read_output(output, "artifact-id") == "987"
+    summary = (tmp_path / "artifact-summary").read_text()
+    assert "987" in summary
+    assert name in summary
+    assert digest in summary
+    download = _step("prepare-pypi", "download-release-artifact")
+    assert download["with"]["artifact-ids"] == (
+        "${{ steps.resolve-release-artifact.outputs.artifact-id }}"
+    )
+    assert download["with"]["run-id"] == "${{ github.run_id }}"
+    assert download["with"]["digest-mismatch"] == "error"
+
+
+def test_production_recovery_topology_has_one_terminal_verifier() -> None:
+    """Changing conditions can republish exact state, top up partial state, or hide failure."""
+    prepare = _job("prepare-pypi")
+    publish = _job("publish-pypi")
+    verify = _job("verify-pypi")
+    assert prepare["environment"] == "pypi"
+    assert prepare["outputs"]["state"] == "${{ steps.resolve-prepare-state.outputs.state }}"
+    assert _step("prepare-pypi", "stage")["if"] == (
+        "steps.resolve-prepare-state.outputs.state == 'ABSENT'"
+    )
+    assert _step("prepare-pypi", "upload-staging-artifact")["if"] == (
+        "steps.resolve-prepare-state.outputs.state == 'ABSENT'"
+    )
+    assert publish["if"] == "needs.prepare-pypi.outputs.state == 'ABSENT'"
+    assert publish["needs"] == "prepare-pypi"
+    assert verify["needs"] == ["bind-build-attest", "prepare-pypi", "publish-pypi"]
+    assert verify["if"] == (
+        "${{ always() && !cancelled() && needs.prepare-pypi.result == 'success' }}"
+    )
+    assert "needs.publish-pypi.result" not in verify["if"]
+    assert (
+        _step("verify-pypi", "classify-pypi-state")["run"]
+        == _step("prepare-pypi", "classify-pypi-state")["run"]
+    )
+    terminal = _step("verify-pypi", "require-exact-complete")
+    assert terminal["env"]["STATE"] == "${{ steps.classify-pypi-state.outputs.state }}"
+    assert "EXACT_COMPLETE" in terminal["run"]
+    assert not any("continue-on-error" in step for step in publish["steps"])
+
+
+_PREPARE_EVIDENCE_STEPS = (
+    "resolve-release-artifact",
+    "download-release-artifact",
+    "verify-release-bundle",
+    "classify-pypi-state",
+)
+
+
+def test_prepare_evidence_failures_funnel_into_uncertain_not_job_failure() -> None:
+    """A hard prepare failure skips the terminal verifier and hides a lost upload."""
+    for step_id in _PREPARE_EVIDENCE_STEPS:
+        assert _step("prepare-pypi", step_id).get("continue-on-error") is True
+    assert _step("prepare-pypi", "download-release-artifact")["if"] == (
+        "steps.resolve-release-artifact.outcome == 'success'"
+    )
+    assert _step("prepare-pypi", "verify-release-bundle")["if"] == (
+        "steps.download-release-artifact.outcome == 'success'"
+    )
+    assert _step("prepare-pypi", "classify-pypi-state")["if"] == (
+        "steps.verify-release-bundle.outcome == 'success'"
+    )
+    resolver = _step("prepare-pypi", "resolve-prepare-state")
+    assert "if" not in resolver
+    assert "continue-on-error" not in resolver
+    assert resolver["env"]["CLASSIFY_OUTCOME"] == "${{ steps.classify-pypi-state.outcome }}"
+    # The terminal verifier must keep failing hard on the same evidence.
+    for step_id in _PREPARE_EVIDENCE_STEPS:
+        verify_step = _step("verify-pypi", step_id)
+        assert "continue-on-error" not in verify_step
+        assert "if" not in verify_step
+    verify_step_ids = [step.get("id") for step in _job("verify-pypi")["steps"]]
+    assert "resolve-prepare-state" not in verify_step_ids
+
+
+def _run_prepare_state_resolver(
+    tmp_path: Path, outcomes: dict[str, str]
+) -> tuple[subprocess.CompletedProcess[str], str, str]:
+    output = tmp_path / "resolver-output"
+    summary = tmp_path / "resolver-summary"
+    env = os.environ | {
+        "CLASSIFIED_REASON": "",
+        "CLASSIFIED_STATE": "",
+        "CLASSIFY_OUTCOME": "skipped",
+        "DOWNLOAD_OUTCOME": "success",
+        "GITHUB_OUTPUT": str(output),
+        "GITHUB_STEP_SUMMARY": str(summary),
+        "RESOLVE_OUTCOME": "success",
+        "VERIFY_OUTCOME": "success",
+    }
+    env.update(outcomes)
+    result = _run_yaml_script(
+        _step("prepare-pypi", "resolve-prepare-state")["run"],
+        cwd=tmp_path,
+        env=env,
+        tmp_path=tmp_path,
+        timeout_seconds=15,
+    )
+    state = _read_output(output, "state") if output.exists() else ""
+    reason = _read_output(output, "reason") if output.exists() else ""
+    return result, state, reason
+
+
+@pytest.mark.parametrize(
+    "outcomes",
+    [
+        {"RESOLVE_OUTCOME": "failure"},
+        {"DOWNLOAD_OUTCOME": "failure"},
+        {"VERIFY_OUTCOME": "failure"},
+        {"CLASSIFY_OUTCOME": "failure"},
+        {"CLASSIFY_OUTCOME": "skipped"},
+        {"CLASSIFY_OUTCOME": "success"},  # succeeded but emitted no state
+    ],
+)
+def test_prepare_state_resolver_reports_uncertain_for_missing_evidence(
+    tmp_path: Path, outcomes: dict[str, str]
+) -> None:
+    """Terminating prepare on evidence failure would skip the sole terminal verifier."""
+    result, state, reason = _run_prepare_state_resolver(tmp_path, outcomes)
+    assert result.returncode == 0, result.stderr
+    assert state == "UNCERTAIN"
+    assert reason
+
+
+@pytest.mark.parametrize("classified_state", ["ABSENT", "EXACT_COMPLETE", "PARTIAL", "UNCERTAIN"])
+def test_prepare_state_resolver_passes_through_classified_states(
+    tmp_path: Path, classified_state: str
+) -> None:
+    """The resolver must not invent, drop, or rewrite a genuine classification."""
+    result, state, reason = _run_prepare_state_resolver(
+        tmp_path,
+        {
+            "CLASSIFY_OUTCOME": "success",
+            "CLASSIFIED_STATE": classified_state,
+            "CLASSIFIED_REASON": "classifier evidence reason",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert state == classified_state
+    assert reason == "classifier evidence reason"
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "ABSENT",
+        "EXACT_COMPLETE",
+        "PARTIAL",
+        "MISMATCH",
+        "YANKED",
+        "EXTRA",
+        "COMPETING",
+        "UNCERTAIN",
+    ],
+)
+def test_terminal_verifier_succeeds_only_for_exact_complete(state: str, tmp_path: Path) -> None:
+    """Any other successful terminal state can hide a lost or immutable partial upload."""
+    step = _step("verify-pypi", "require-exact-complete")
+    result = _run_yaml_script(
+        step["run"],
+        cwd=_ROOT,
+        env=os.environ | {"STATE": state},
+        tmp_path=tmp_path,
+        timeout_seconds=15,
+    )
+    assert (result.returncode == 0) is (state == "EXACT_COMPLETE")
+
+
+def test_production_classifier_worst_case_fits_verifier_timeout() -> None:
+    """Bounded ABSENT rechecks and both byte downloads leave five minutes of headroom."""
+    job = _job("verify-pypi")
+    env = _step("verify-pypi", "classify-pypi-state")["env"]
+    attempts = int(env["ABSENT_RECHECK_MAX_ATTEMPTS"])
+    retry_base = int(env["ABSENT_RECHECK_BASE_SECONDS"])
+    snapshot_pair = 2 * int(env["INDEX_TOTAL_SECONDS"]) + int(env["SNAPSHOT_DELAY_SECONDS"])
+    backoff = sum(min(recheck * retry_base, 30) for recheck in range(1, attempts))
+    classifier_worst_case = (
+        attempts * snapshot_pair + backoff + 2 * int(env["DOWNLOAD_TOTAL_SECONDS"])
+    )
+    assert int(job["timeout-minutes"]) * 60 - classifier_worst_case >= 300
+    assert int(env["SOCKET_TIMEOUT_SECONDS"]) < int(env["INDEX_TOTAL_SECONDS"])
+    assert "signal.setitimer" in _step("verify-pypi", "classify-pypi-state")["run"]
+    prepare_env = _step("prepare-pypi", "classify-pypi-state")["env"]
+    prepare_worst_case = snapshot_pair + 2 * int(prepare_env["DOWNLOAD_TOTAL_SECONDS"])
+    assert int(_job("prepare-pypi")["timeout-minutes"]) * 60 - prepare_worst_case >= 300
+
+
+def test_verify_pypi_retries_absent_but_prepare_classifies_once() -> None:
+    """Prepare must keep single-pass semantics; only terminal verification retries.
+
+    A retrying prepare could wait out genuine absence differently than the
+    reviewed publish gate expects, while a non-retrying terminal verifier fails
+    the happy path on routine PyPI index-propagation lag after publish-pypi.
+    """
+    prepare_env = _step("prepare-pypi", "classify-pypi-state")["env"]
+    verify_env = _step("verify-pypi", "classify-pypi-state")["env"]
+    assert int(prepare_env["ABSENT_RECHECK_MAX_ATTEMPTS"]) == 1
+    assert int(verify_env["ABSENT_RECHECK_MAX_ATTEMPTS"]) > 1
+    assert int(verify_env["ABSENT_RECHECK_BASE_SECONDS"]) > 0
+    # The retry knob is the only permitted divergence between the two envs.
+    divergent = {
+        key
+        for key in prepare_env.keys() | verify_env.keys()
+        if prepare_env.get(key) != verify_env.get(key)
+    }
+    assert divergent == {"ABSENT_RECHECK_MAX_ATTEMPTS", "ABSENT_RECHECK_BASE_SECONDS"}
+
+
+def test_pypi_classifier_rechecks_absent_within_bounded_attempts(
+    tmp_path: Path,
+    package_index_server: tuple[str, dict[str, Any]],
+) -> None:
+    """An ABSENT snapshot pair is re-taken until stable evidence appears."""
+    base_url, server = package_index_server
+    _, payload = _prepare_index_case(tmp_path, base_url, server)
+    server["index_responses"] = [404, 404, 404, 404, payload, payload]
+    result, state = _run_pypi_classifier(
+        tmp_path,
+        base_url,
+        env_overrides={
+            "ABSENT_RECHECK_MAX_ATTEMPTS": "5",
+            "ABSENT_RECHECK_BASE_SECONDS": "0",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert state == "EXACT_COMPLETE"
+    assert server["index_calls"] == 6
+
+
+@pytest.mark.parametrize(
+    ("responses", "expected_state", "expected_calls"),
+    [
+        # Persistent absence exhausts the bounded budget and stays ABSENT.
+        ([404, 404, 404, 404, 404, 404], "ABSENT", 6),
+        # Snapshot instability is UNCERTAIN and must not consume retry budget.
+        ([404, "payload", 404, 404], "UNCERTAIN", 2),
+    ],
+)
+def test_pypi_classifier_absent_recheck_is_bounded_and_absent_only(
+    tmp_path: Path,
+    package_index_server: tuple[str, dict[str, Any]],
+    responses: list[Any],
+    expected_state: str,
+    expected_calls: int,
+) -> None:
+    """Only a stable ABSENT pair retries; the per-attempt stability rule survives."""
+    base_url, server = package_index_server
+    _, payload = _prepare_index_case(tmp_path, base_url, server)
+    server["index_responses"] = [payload if item == "payload" else item for item in responses]
+    result, state = _run_pypi_classifier(
+        tmp_path,
+        base_url,
+        env_overrides={
+            "ABSENT_RECHECK_MAX_ATTEMPTS": "3",
+            "ABSENT_RECHECK_BASE_SECONDS": "0",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert state == expected_state
+    assert server["index_calls"] == expected_calls
+
+
+def test_production_classifier_pins_https_pypi_index_origin() -> None:
+    """An off-origin index redirect could impersonate absence and trigger a republish."""
+    for job_id in ("prepare-pypi", "verify-pypi"):
+        env = _step(job_id, "classify-pypi-state")["env"]
+        assert env["INDEX_JSON_BASE"] == "https://pypi.org/pypi"
+        assert env["ALLOWED_INDEX_HOST"] == "pypi.org"
+        assert env["REQUIRED_INDEX_SCHEME"] == "https"
+        assert env["ALLOWED_FILE_HOST"] == "files.pythonhosted.org"
+        assert env["REQUIRED_FILE_SCHEME"] == "https"
+
+
+def test_prepare_and_verifier_share_artifact_and_remote_evidence_scripts() -> None:
+    """Divergent recovery verification can bless evidence normal verification rejects."""
+    assert (
+        _step("prepare-pypi", "resolve-release-artifact")["run"]
+        == _step("verify-pypi", "resolve-release-artifact")["run"]
+    )
+    assert (
+        _step("prepare-pypi", "verify-release-bundle")["run"]
+        == _step("verify-pypi", "verify-release-bundle")["run"]
+    )
+    assert (
+        _step("prepare-pypi", "classify-pypi-state")["run"]
+        == _step("verify-pypi", "classify-pypi-state")["run"]
+    )
+
+
+def test_only_absent_state_can_reach_action_only_production_publisher() -> None:
+    """Any broader publisher guard permits republish or immutable one-file top-up."""
+    publish = _job("publish-pypi")
+    assert publish["environment"] == "pypi"
+    assert publish["permissions"] == {"contents": "read", "id-token": "write"}
+    assert publish["if"] == "needs.prepare-pypi.outputs.state == 'ABSENT'"
+    assert len(publish["steps"]) == 2
+    assert all(set(step) <= {"uses", "with", "name"} for step in publish["steps"])
+    assert all("run" not in step for step in publish["steps"])
+    assert "skip-existing" not in publish["steps"][1].get("with", {})
+    workflow = _workflow()
+    production_oidc = [
+        job_id
+        for job_id, job in workflow["jobs"].items()
+        if job.get("permissions", {}).get("id-token") == "write"
+        and job.get("environment") == "pypi"
+    ]
+    assert production_oidc == ["publish-pypi"]
+    assert not any("continue-on-error" in job for job in workflow["jobs"].values())
+    tolerated = [
+        (job_id, step.get("id"))
+        for job_id, job in workflow["jobs"].items()
+        for step in job["steps"]
+        if "continue-on-error" in step
+    ]
+    # Only prepare-pypi evidence steps may tolerate failure: they funnel into an
+    # UNCERTAIN prepare result so the sole terminal verifier still runs and fails.
+    assert tolerated == [("prepare-pypi", step_id) for step_id in _PREPARE_EVIDENCE_STEPS]
+
+
+# CI-only artifact-action contract facts, verified 2026-08-18 against the pinned
+# actions' committed sources (evidence, including the verified file hashes, lives
+# in .github/WORKFLOWS.md under "Pinned artifact-action contract evidence"):
+# - actions/download-artifact `action.yml` declares the `digest-mismatch` input
+#   (unknown action inputs are silently ignored, so existence at the exact pin is
+#   load-bearing) and `src/download-artifact.ts` selects `resolvedPath` whenever
+#   `artifacts.length === 1`, so a single-`artifact-ids` download extracts flat
+#   into `path:`, not into a per-artifact subdirectory.
+# - actions/upload-artifact `action.yml` declares the `artifact-digest` output and
+#   `src/shared/upload-artifact.ts` emits the toolkit's bare-hex SHA-256 (no
+#   `sha256:` prefix), matching the workflow's `[0-9a-f]{64}` fullmatch.
+_VERIFIED_ARTIFACT_ACTION_CONTRACTS = {
+    "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c": (
+        "e98559b7a31ba31be4709f20d22102dc2737fa630f69a339eb89981151e505fe"
+    ),
+    "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a": (
+        "c5979822866a72362e609844b6ebe77d4b7e759af68cc1c2c425dcf51481fab4"
+    ),
+}
+
+
+def test_artifact_action_pins_match_recorded_contract_verification() -> None:
+    """Every artifact-action pin must carry recorded contract evidence.
+
+    Bumping either pin invalidates the recorded verification of the CI-only
+    contract facts above, so the new SHA must be re-verified and both this map
+    and the WORKFLOWS.md evidence note updated before the pin can land.
+    """
+    used = {
+        step["uses"]
+        for job in _workflow()["jobs"].values()
+        for step in job["steps"]
+        if step.get("uses", "").split("@")[0]
+        in {"actions/download-artifact", "actions/upload-artifact"}
+    }
+    assert used == set(_VERIFIED_ARTIFACT_ACTION_CONTRACTS)
+    evidence = (_ROOT / ".github" / "WORKFLOWS.md").read_text()
+    for pin, action_yml_sha256 in _VERIFIED_ARTIFACT_ACTION_CONTRACTS.items():
+        assert pin.split("@")[1] in evidence
+        assert action_yml_sha256 in evidence
+    # The digest binding only holds if every by-id download opts into hard failure.
+    for job in _workflow()["jobs"].values():
+        for step in job["steps"]:
+            if "download-artifact@" in step.get("uses", ""):
+                with_options = step.get("with", {})
+                if "artifact-ids" in with_options:
+                    assert with_options["digest-mismatch"] == "error"
 
 
 def test_all_release_actions_are_immutable_full_sha_pins() -> None:
@@ -1317,7 +2457,13 @@ def test_build_produces_exactly_two_bit_reproducible_distributions(tmp_path: Pat
             "OUTPUT_DIR": str(output),
             "SOURCE_DATE_EPOCH": ambient_epoch,
         }
-        result = subprocess.run(["bash", "-c", script], env=env, text=True, capture_output=True)
+        result = _run_yaml_script(
+            script,
+            cwd=_ROOT,
+            env=env,
+            tmp_path=tmp_path,
+            timeout_seconds=180,
+        )
         assert result.returncode == 0, result.stderr
         files = sorted(path for path in output.iterdir() if path.is_file())
         assert sum(path.suffix == ".whl" for path in files) == 1
@@ -1355,7 +2501,13 @@ def test_build_container_rejects_wrong_backend_or_tool_version(
         "OUTPUT_DIR": str(output),
         "SOURCE_DATE_EPOCH": "1755302400",
     }
-    result = subprocess.run(["bash", "-c", script], env=env, capture_output=True, check=False)
+    result = _run_yaml_script(
+        script,
+        cwd=_ROOT,
+        env=env,
+        tmp_path=tmp_path,
+        timeout_seconds=180,
+    )
     assert result.returncode != 0
 
 
@@ -1381,10 +2533,11 @@ def test_build_container_denies_network_when_workflow_network_flag_is_mutated(
         "OUTPUT_DIR": str(output),
         "SOURCE_DATE_EPOCH": "1755302400",
     }
-    result = subprocess.run(
-        ["bash", "-c", script],
+    result = _run_yaml_script(
+        script,
+        cwd=_ROOT,
         env=env,
-        capture_output=True,
-        check=False,
+        tmp_path=tmp_path,
+        timeout_seconds=180,
     )
     assert result.returncode != 0
