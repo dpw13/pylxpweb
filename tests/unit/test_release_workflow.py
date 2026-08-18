@@ -403,6 +403,28 @@ def _release_repo(
             }
         ],
         f"repos/{repository}/collaborators/reviewer/permission": {"permission": "write"},
+        f"repos/{repository}/collaborators": [
+            {
+                "login": "author",
+                "permissions": {
+                    "admin": True,
+                    "maintain": True,
+                    "push": True,
+                    "triage": True,
+                    "pull": True,
+                },
+            },
+            {
+                "login": "reviewer",
+                "permissions": {
+                    "admin": False,
+                    "maintain": False,
+                    "push": True,
+                    "triage": True,
+                    "pull": True,
+                },
+            },
+        ],
         f"repos/{repository}/commits/{head}/check-runs": {
             "check_runs": [
                 {
@@ -1254,6 +1276,68 @@ def test_binding_reads_all_review_pages_before_deciding(tmp_path: Path) -> None:
     }
     result = _run_binding(case, tmp_path)
     assert result.returncode != 0
+
+
+_SOLO_WAIVER_NOTICE = (
+    "solo-maintainer waiver: no eligible non-author reviewer exists; approval binding waived"
+)
+
+
+def test_binding_still_requires_non_self_approval_when_team_exists(tmp_path: Path) -> None:
+    """Another write-or-higher collaborator existing keeps the approval binding armed."""
+    case = _release_repo(tmp_path)
+    review_key = "repos/joyfulhouse/pylxpweb/pulls/17/reviews"
+    case["fixtures"][review_key][0]["user"]["login"] = "author"
+    case["fixtures"]["repos/joyfulhouse/pylxpweb/collaborators/author/permission"] = {
+        "permission": "admin"
+    }
+    result = _run_binding(case, tmp_path)
+    assert result.returncode != 0
+    assert "no effective eligible non-self approval" in result.stderr
+    assert _SOLO_WAIVER_NOTICE not in result.stdout
+
+
+def test_binding_waives_approval_when_author_is_sole_eligible_collaborator(
+    tmp_path: Path,
+) -> None:
+    """A solo-maintainer repo releases without approval, with an explicit log notice."""
+    case = _release_repo(tmp_path)
+    case["fixtures"]["repos/joyfulhouse/pylxpweb/pulls/17/reviews"] = []
+    case["fixtures"]["repos/joyfulhouse/pylxpweb/collaborators"] = [
+        {
+            "login": "author",
+            "permissions": {
+                "admin": True,
+                "maintain": True,
+                "push": True,
+                "triage": True,
+                "pull": True,
+            },
+        },
+        {
+            "login": "watcher",
+            "permissions": {
+                "admin": False,
+                "maintain": False,
+                "push": False,
+                "triage": False,
+                "pull": True,
+            },
+        },
+    ]
+    result = _run_binding(case, tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert _SOLO_WAIVER_NOTICE in result.stdout
+
+
+def test_binding_fails_closed_when_collaborator_listing_errors(tmp_path: Path) -> None:
+    """An error while listing collaborators must fail the release, never waive it."""
+    case = _release_repo(tmp_path)
+    case["fixtures"]["repos/joyfulhouse/pylxpweb/pulls/17/reviews"] = []
+    del case["fixtures"]["repos/joyfulhouse/pylxpweb/collaborators"]
+    result = _run_binding(case, tmp_path)
+    assert result.returncode != 0
+    assert _SOLO_WAIVER_NOTICE not in result.stdout
 
 
 @pytest.mark.parametrize("step_id", ["assert-clean-source", "seal-source"])

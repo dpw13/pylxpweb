@@ -34,7 +34,13 @@ Publishing is a linear seven-job promotion chain:
    pull request. Its first parent is the previous `main`, its second parent is the
    final pull-request head, and the first parent must be an ancestor of that head.
    The PR base is `main`; GitHub's mutable `pull.base.sha` is not used as historical
-   merge evidence. An effective non-self approval covers the exact head. The
+   merge evidence. An effective non-self approval covers the exact head whenever
+   the repository has at least one write-or-higher collaborator other than the PR
+   author; when the author is the sole write-or-higher collaborator, the approval
+   binding is waived and an explicit `solo-maintainer waiver` notice is printed
+   into the job log. The waiver decision is derived from the same GitHub
+   collaborator-permission data the review gate already trusts, and any error
+   while listing collaborators fails closed — an error is never a waiver. The
    head's single `CI Success` check must come from GitHub Actions and resolve to a
    successful pull-request run of this repository's `.github/workflows/ci.yml`.
 2. The same job builds once in the official uv/Python 3.13 image pinned by the
@@ -188,10 +194,17 @@ unfreezing publication and again during release review:
 - `main` is protected: the final release-candidate PR requires review, dismisses
   stale approval, requires `CI Success`, requires the branch to be up to date,
   prevents bypass, and is merged with GitHub's **Create a merge commit** method.
+  On a solo-maintainer repository (the PR author is the only write-or-higher
+  collaborator), required review cannot be satisfied by anyone else; the
+  workflow's approval binding waives itself in that case, and the branch
+  protection review requirement may be relaxed accordingly until a second
+  eligible collaborator exists — at which point the non-self approval binding
+  re-arms automatically.
 - A tag ruleset protects `v*` tags from update and deletion except for the narrow,
   audited recovery operation described below.
-- The `pypi` environment requires an independent reviewer, limits deployments to
-  protected `v*` tags, and disallows administrator bypass.
+- The `pypi` environment requires an independent reviewer (on a solo-maintainer
+  repository, the maintainer themself — the explicit human promotion decision),
+  limits deployments to protected `v*` tags, and disallows administrator bypass.
 - The `testpypi` environment limits deployments to protected `v*` tags.
 - PyPI and TestPyPI trusted-publisher bindings match this repository, the
   `release.yml` workflow, and their respective environment names.
@@ -207,7 +220,8 @@ or mutate repository, environment, or package-index settings.
 1. Prepare the final version and every release-tree change in one final candidate
    pull request. `project.version` must equal the intended tag without `v`.
 2. Obtain an effective approval and successful required CI on the exact final head.
-   If the head changes, repeat both gates.
+   If the head changes, repeat both gates. On a solo-maintainer repository the
+   workflow waives the approval gate (with a logged notice); CI is still required.
 3. Merge with GitHub **Create a merge commit**. Do not squash or rebase.
 4. Confirm no later commit has reached `main`, then create the protected `v*` tag
    on that GitHub merge commit and publish the GitHub Release for the same tag.
