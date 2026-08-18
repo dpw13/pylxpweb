@@ -74,6 +74,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   container builds from a read-only source mount without network access; source
   and distribution attestations are verified before package-index staging.
 
+- **Provenance-bound PyPI recovery for closed publications**
+  ([#299](https://github.com/joyfulhouse/pylxpweb/issues/299), PR
+  [#303](https://github.com/joyfulhouse/pylxpweb/pull/303)):
+  when the release workflow finds the version already on PyPI, it classifies
+  the closed publication state as exact-complete, partial, mismatched, or
+  uncertain instead of failing opaquely. Recovery rediscovers the run-scoped
+  sealed artifacts and verifies their attestations before publishing only
+  ABSENT files — never rebuilding, republishing exact-complete state, using
+  production `skip-existing`, or broadening publisher authority; evidence gaps
+  and remote conflicts fail closed through UNCERTAIN. An unprivileged terminal
+  verify-pypi job confirms the final index state, and the recovery runbook is
+  documented in `.github/WORKFLOWS.md`.
+
 ## [0.10.0b2] - 2026-08-15
 
 ### Added
