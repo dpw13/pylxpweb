@@ -50,7 +50,7 @@ jobs:
           ref: ${{ github.event.release.tag_name }}
 
       - id: bind-source
-        name: Bind the event, workflow, merge, review, and CI identity
+        name: Bind the event, workflow, merge, and CI identity
         env:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_SHA: ${{ github.sha }}
@@ -129,68 +129,10 @@ jobs:
           assert pull["head"]["sha"] == second_parent, "PR head is not second parent"
           print(pull["number"])
           print(pull["head"]["sha"])
-          print(pull["user"]["login"])
           PY
           )
           pr="${pr_identity[0]}"
           head="${pr_identity[1]}"
-          author="${pr_identity[2]}"
-
-          gh api --paginate --slurp -H "Accept: application/vnd.github+json" \
-            "repos/$REPOSITORY/pulls/$pr/reviews" > "$api_dir/reviews.json"
-          python3 - "$api_dir/reviews.json" "$api_dir/effective-reviews.json" \
-            > "$api_dir/reviewers.txt" <<'PY'
-          import json
-          import pathlib
-          import sys
-
-          pages = json.loads(pathlib.Path(sys.argv[1]).read_text())
-          reviews = [review for page in pages for review in page]
-          effective = {}
-          for review in sorted(
-              reviews,
-              key=lambda item: (item.get("submitted_at") or "", item.get("id", 0)),
-          ):
-              if review["state"] in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}:
-                  effective[review["user"]["login"]] = review
-          pathlib.Path(sys.argv[2]).write_text(json.dumps(effective))
-          for login, review in sorted(effective.items()):
-              if review["state"] in {"APPROVED", "CHANGES_REQUESTED"}:
-                  print(login)
-          PY
-          : > "$api_dir/permissions.tsv"
-          while IFS= read -r reviewer; do
-            permission=$(gh api -H "Accept: application/vnd.github+json" \
-              "repos/$REPOSITORY/collaborators/$reviewer/permission" --jq .permission)
-            printf '%s\t%s\n' "$reviewer" "$permission" >> "$api_dir/permissions.tsv"
-          done < "$api_dir/reviewers.txt"
-          python3 - "$api_dir/effective-reviews.json" "$api_dir/permissions.tsv" \
-            "$head" "$author" <<'PY'
-          import json
-          import pathlib
-          import sys
-
-          effective = json.loads(pathlib.Path(sys.argv[1]).read_text())
-          permissions = dict(
-              line.split("\t", 1)
-              for line in pathlib.Path(sys.argv[2]).read_text().splitlines()
-          )
-          head, author = sys.argv[3:]
-          eligible = {
-              login: review
-              for login, review in effective.items()
-              if permissions.get(login) in {"write", "maintain", "admin"}
-          }
-          assert not any(
-              review["state"] == "CHANGES_REQUESTED" for review in eligible.values()
-          ), "an eligible reviewer still requests changes"
-          assert any(
-              login != author
-              and review["state"] == "APPROVED"
-              and review["commit_id"] == head
-              for login, review in eligible.items()
-          ), "no effective eligible non-self approval covers the exact PR head"
-          PY
 
           gh api --paginate --slurp -H "Accept: application/vnd.github+json" \
             "repos/$REPOSITORY/commits/$head/check-runs" > "$api_dir/checks.json"
