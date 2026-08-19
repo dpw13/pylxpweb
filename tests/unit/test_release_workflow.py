@@ -273,9 +273,6 @@ if len(sys.argv) >= 2 and sys.argv[1] == "api":
         print(f"unexpected endpoint: {endpoint}", file=sys.stderr)
         raise SystemExit(2)
     value = fixtures[endpoint]
-    if "--jq" in sys.argv:
-        print(value[sys.argv[sys.argv.index("--jq") + 1].removeprefix(".")])
-        raise SystemExit(0)
     if "--slurp" in sys.argv:
         if isinstance(value, list):
             pages = [value[index : index + 30] for index in range(0, len(value), 30)]
@@ -967,7 +964,7 @@ def test_checkout_depth_exposes_both_merge_parents(tmp_path: Path) -> None:
 def test_binding_rejects_event_workflow_and_version_identity_mismatch(
     tmp_path: Path, override: dict[str, str], message: str
 ) -> None:
-    """Weakening any event/workflow/tag equality permits an unreviewed identity."""
+    """Weakening any event/workflow/tag equality permits an unbound identity."""
     case = _release_repo(tmp_path)
     if override.get("RELEASE_TAG") == "v9.9.9":
         override["WORKFLOW_REF"] = (
@@ -1009,7 +1006,7 @@ def test_binding_rejects_merge_tree_not_tested_on_exact_pr_head(tmp_path: Path) 
     case = _release_repo(tmp_path)
     repo: Path = case["repo"]
     old_merge = case["merge"]
-    repo.joinpath("injected.txt").write_text("not reviewed\n")
+    repo.joinpath("injected.txt").write_text("not CI-tested\n")
     subprocess.run(["git", "add", "injected.txt"], cwd=repo, check=True)
     tree = _git(repo, "write-tree")
     altered = subprocess.check_output(
@@ -1067,7 +1064,7 @@ def test_binding_does_not_treat_mutable_pr_base_sha_as_merge_parent(tmp_path: Pa
     ],
 )
 def test_binding_rejects_invalid_merge_and_associated_pr(tmp_path: Path, mutation: str) -> None:
-    """Relaxing merge geometry or PR identity admits a non-reviewed candidate."""
+    """Relaxing merge geometry or PR identity admits a non-CI-tested candidate."""
     case = _release_repo(tmp_path)
     repo: Path = case["repo"]
     pull_key = f"repos/joyfulhouse/pylxpweb/commits/{case['merge']}/pulls"
@@ -1125,12 +1122,14 @@ def test_binding_rejects_invalid_merge_and_associated_pr(tmp_path: Path, mutatio
     assert result.returncode != 0
 
 
-@pytest.mark.parametrize("mutation", ["failed-ci", "wrong-ci-head"])
+@pytest.mark.parametrize("mutation", ["missing-ci", "failed-ci", "wrong-ci-head"])
 def test_binding_rejects_missing_or_stale_required_ci(tmp_path: Path, mutation: str) -> None:
     """Dropping the exact-head CI-success binding permits an untested candidate."""
     case = _release_repo(tmp_path)
     check_key = f"repos/joyfulhouse/pylxpweb/commits/{case['head']}/check-runs"
-    if mutation == "failed-ci":
+    if mutation == "missing-ci":
+        case["fixtures"][check_key]["check_runs"] = []
+    elif mutation == "failed-ci":
         case["fixtures"][check_key]["check_runs"][0]["conclusion"] = "failure"
     elif mutation == "wrong-ci-head":
         case["fixtures"][check_key]["check_runs"][0]["head_sha"] = case["parent"]
