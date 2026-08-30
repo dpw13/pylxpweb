@@ -382,14 +382,15 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
             return None
 
         if not getattr(ssl, "HAS_PSK", False):
-            # Only added in python 3.13
+            # Requires an OpenSSL build with PSK support
             raise NotImplementedError("SSL was requested but PSK support is missing")
 
         # Compute PSK from the key and the dongle serial
         psk = hmac.digest(
             bytes.fromhex("4c7578506f77657254656b21"),
             self._dongle_serial.encode("utf-8"),
-            digest=hashlib.sha256)
+            digest=hashlib.sha256,
+        )
 
         def get_psk(_hint: str | None) -> tuple[str, bytes]:
             # Only the first 16 bytes are used for the PSK
@@ -401,7 +402,7 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
         ssl_ctx.options |= ssl.OP_NO_TLSv1
         ssl_ctx.options |= ssl.OP_NO_TLSv1_1
         ssl_ctx.set_psk_client_callback(get_psk)
-        ssl_ctx.set_ciphers('DHE-PSK-AES128-GCM-SHA256')
+        ssl_ctx.set_ciphers("DHE-PSK-AES128-GCM-SHA256")
 
         return ssl_ctx
 
@@ -458,8 +459,16 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                         self._raise_if_shutdown()
                         retry_delay *= 2  # Exponential backoff
 
+                    # Only pass the ssl kwarg when TLS is enabled so the
+                    # plain-TCP path keeps the original
+                    # open_connection(host, port) call signature.
+                    ssl_ctx = self._ssl_ctx()
+                    if ssl_ctx is not None:
+                        open_conn = asyncio.open_connection(self._host, self._port, ssl=ssl_ctx)
+                    else:
+                        open_conn = asyncio.open_connection(self._host, self._port)
                     self._reader, self._writer = await asyncio.wait_for(
-                        asyncio.open_connection(self._host, self._port, ssl=self._ssl_ctx()),
+                        open_conn,
                         timeout=self._timeout,
                     )
                     if self._shutdown_requested:
