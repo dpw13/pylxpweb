@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **GridBOSS Modbus discovery: serial number falls back to holding
+  registers 2-6**
+  ([eg4_web_monitor#593](https://github.com/joyfulhouse/eg4_web_monitor/issues/593)):
+  the "serial at input registers 115-119" layout is inverter-family-specific —
+  on MID/GridBOSS devices those registers are AC-couple ports 3-4
+  lifetime-energy counters (`registers/gridboss.py`), which read as zeros on a
+  unit with those ports unused, so local Modbus TCP discovery failed with
+  "Failed to read serial number from device". `read_serial_number()` now falls
+  back to holding registers 2-6 (`HOLD_SERIAL_NUM`, documented for every
+  family) whenever the input-register decode is not a plausible serial —
+  exactly 10 printable ASCII alphanumeric characters. The same plausibility
+  check gates the holding-register result, so a partial or garbage holding
+  decode is never adopted either; the pre-fallback input result is returned
+  unchanged in that case, and a holding read that fails outright (restricted
+  register map) is swallowed the same way rather than turning discovery into
+  a hard failure. The fallback also honors the transport's
+  `inter_register_delay` before switching from input (FC 04) to holding
+  (FC 03) reads, matching the existing MID mixed-space read pattern — WiFi
+  dongles corrupt payloads without that pause. This also stops a latent
+  wrong-identity case: a
+  GridBOSS *with* accumulated AC-couple energy at 115-119 could decode those
+  bytes into printable garbage and silently adopt it as the device serial.
+
 - **GridBOSS Modbus discovery: skip the parallel-config read (input
   register 113)**
   ([eg4_web_monitor#596](https://github.com/joyfulhouse/eg4_web_monitor/issues/596)):
