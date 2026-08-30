@@ -5,9 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.0b5] - 2026-08-29
 
 ### Fixed
+
+- **Unreported battery state of health is `None`, not a fabricated 100**
+  ([#309](https://github.com/joyfulhouse/pylxpweb/issues/309), based on
+  [#286](https://github.com/joyfulhouse/pylxpweb/pull/286) by @sjordan0228):
+  a SoH byte of 0 means the BMS did not report, but every decode path rewrote
+  it to 100 — indistinguishable from a genuinely healthy pack. All Modbus
+  decode sites, the eg4_master/eg4_slave battery protocols, the cloud
+  per-battery path, and the cloud-backed `Battery.soh` property now surface
+  unreported SoH as `None`; `BatteryBank.min_soh`/`soh_delta` exclude
+  unreported batteries, and `is_corrupt()` tolerates `None` while keeping the
+  >100 canary.
 
 - **GridBOSS Modbus discovery: serial number falls back to holding
   registers 2-6**
@@ -2810,7 +2821,8 @@ ac_power = inverter.ac_charge_power_limit  # Property access (uses 1-hour cache)
 - **v0.1.1** (2025-11-15): Bug fixes and improvements
 - **v0.1.0** (2025-11-14): Initial release with core functionality
 
-[Unreleased]: https://github.com/joyfulhouse/pylxpweb/compare/v0.10.0b3...HEAD
+[0.10.0b5]: https://github.com/joyfulhouse/pylxpweb/compare/v0.10.0b4...v0.10.0b5
+[0.10.0b4]: https://github.com/joyfulhouse/pylxpweb/compare/v0.10.0b3...v0.10.0b4
 [0.10.0b3]: https://github.com/joyfulhouse/pylxpweb/compare/v0.10.0b2...v0.10.0b3
 [0.10.0b2]: https://github.com/joyfulhouse/pylxpweb/compare/v0.10.0b1...v0.10.0b2
 [0.10.0b1]: https://github.com/joyfulhouse/pylxpweb/compare/v0.9.39b11...v0.10.0b1
