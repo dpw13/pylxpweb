@@ -123,7 +123,13 @@ class Battery(BaseDevice):
             totalVoltage=int(battery_data.voltage * 100),  # Convert back to raw
             current=int(battery_data.current * 10),  # Convert back to raw
             soc=battery_data.soc,
-            soh=battery_data.soh,
+            # soh may be None (unreported, #309). BatteryModule.soh is
+            # non-nullable, so absence is encoded as 0 here (#249 convention).
+            # The normalized .soh property answers from transport data and
+            # never reads this placeholder — but the raw module is public via
+            # .data, so .data.soh does read 0 on an unreported battery. Use
+            # .soh, not .data.soh, for a measurement.
+            soh=battery_data.soh if battery_data.soh is not None else 0,
             currentRemainCapacity=int(battery_data.remaining_capacity or 0),
             currentFullCapacity=int(battery_data.max_capacity or 0),
             batMaxCellTemp=int(battery_data.max_cell_temperature * 10),
@@ -289,16 +295,21 @@ class Battery(BaseDevice):
         return self._data.soc
 
     @property
-    def soh(self) -> int:
+    def soh(self) -> int | None:
         """Get battery state of health.
 
         Returns:
-            State of health percentage (0-100).
+            State of health percentage (0-100), or None when the BMS
+            does not report it (issue #309).  Transport-backed batteries
+            answer from transport data directly so an unreported SOH
+            stays None instead of falling back to the schema placeholder.
+            Cloud-backed batteries normalize here: BatteryModule.soh is
+            non-nullable, so the portal relays an unreported SOH as 0 —
+            surface that as None, never as a real 0% health measurement.
         """
-        val = self._get_transport_attr("soh")
-        if val is not None:
-            return int(val)
-        return self._data.soh
+        if self._transport_data is not None:
+            return self._transport_data.soh
+        return self._data.soh if self._data.soh else None
 
     # ========== Capacity Properties ==========
 
